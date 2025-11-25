@@ -22,6 +22,7 @@ var/
 wheels/
 *.egg-info/
 .egg-info/
+vllm/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -127,6 +128,8 @@ dmypy.json
 # IDEs
 .vscode/
 .idea/
+.github/
+.trae/
 
 # OS
 .DS_Store
@@ -134,3 +137,5 @@ Thumbs.db
 
 # analysis docs
 analysis.md
+*.doc
+*.docx

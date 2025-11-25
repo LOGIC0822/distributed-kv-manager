@@ -149,12 +149,12 @@ chmod +x run.sh
 ### 启动 vLLM OpenAI 兼容服务（v0 接口）
 
 ```bash
-VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+python3 vllm_adapter/vllm_start_with_inject.py \
   --model /tmp/ckpt/Qwen --port 8100 --max-model-len 10000 \
   --gpu-memory-utilization 0.8 \
   --kv-transfer-config '{"kv_connector":"DistributedKVConnector","kv_role":"kv_both"}'
 
-VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+python3 vllm_adapter/vllm_start_with_inject.py \
   --model /tmp/ckpt/Qwen3-0.6B --port 8100 --max-model-len 10000 \
   --gpu-memory-utilization 0.8 \
   --kv-transfer-config '{"kv_connector":"DistributedKVConnector","kv_role":"kv_both"}'

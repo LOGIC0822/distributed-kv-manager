@@ -4,17 +4,23 @@ import subprocess
 import torch
 import logging
 from typing import Optional, Tuple
+
 from .base import AbstractStorage
+from distributed_kv_manager.storage.v0.layout import (
+    pack_kv_local_v0,
+    unpack_kv_local_v0,
+)
 
 logger = logging.getLogger("CrailStorage")
 
+
 class CrailStorage(AbstractStorage):
     """封装Crail文件操作，实现AbstractStorage接口"""
-    
+
     def __init__(self, crail_dir: str):
         self.crail_dir = crail_dir
         os.makedirs(self.crail_dir, exist_ok=True)
-        
+
     def upload(self, file_path: str, data: bytes) -> bool:
         """上传数据到Crail"""
         jar_path = os.environ.get("CRAIL_KVCACHE_JAR", "crail-kvcache-client.jar")
@@ -23,7 +29,7 @@ class CrailStorage(AbstractStorage):
             "java", "-Djava.library.path=/root/crail/lib",
             f"-Dcrail.conf.dir={conf_dir}",
             "-cp", f"{jar_path}:{conf_dir}:/root/crail/jars/*",
-            "com.example.CrailKVCacheManager", "upload-stream", file_path
+            "com.example.CrailKVCacheManager", "upload-stream", file_path,
         ]
         try:
             process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -45,7 +51,7 @@ class CrailStorage(AbstractStorage):
             "java", "-Djava.library.path=/root/crail/lib",
             f"-Dcrail.conf.dir={conf_dir}",
             "-cp", f"{jar_path}:{conf_dir}:/root/crail/jars/*",
-            "com.example.CrailKVCacheManager", "download-stream", file_path
+            "com.example.CrailKVCacheManager", "download-stream", file_path,
         ]
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -81,7 +87,7 @@ class CrailStorage(AbstractStorage):
             "java", "-Djava.library.path=/root/crail/lib",
             f"-Dcrail.conf.dir={conf_dir}",
             "-cp", f"{jar_path}:{conf_dir}:/root/crail/jars/*",
-            "com.example.CrailKVCacheManager", "exists", file_path
+            "com.example.CrailKVCacheManager", "exists", file_path,
         ]
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -97,25 +103,14 @@ class CrailStorage(AbstractStorage):
         input_tokens: torch.Tensor,
         roi: torch.Tensor,
     ) -> bytes:
-        """打包KV数据为字节流"""
-        data = {
-            "k_cache": k_cache.cpu(),
-            "v_cache": v_cache.cpu(),
-            "input_tokens": input_tokens.cpu(),
-            "roi": roi.cpu()
-        }
-        buffer = io.BytesIO()
-        torch.save(data, buffer)
-        return buffer.getvalue()
+        """打包KV数据为字节流（v0 layout）"""
+        return pack_kv_local_v0(k_cache, v_cache, input_tokens, roi)
 
     def unpack_kv_data(
         self, data: bytes
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """从字节流解包KV数据"""
-        try:
-            buffer = io.BytesIO(data)
-            loaded = torch.load(buffer, map_location="cpu")
-            return loaded["k_cache"], loaded["v_cache"]
-        except Exception as e:
-            logger.error(f"Failed to unpack KV data: {e}")
-            return None, None
+        """从字节流解包KV数据（v0 layout）"""
+        k_cache, v_cache = unpack_kv_local_v0(data)
+        if k_cache is None or v_cache is None:
+            logger.error("Failed to unpack KV data via v0 layout")
+        return k_cache, v_cache

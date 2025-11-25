@@ -1,10 +1,34 @@
 # test_metadata_recovery.py 
 import os
 import tempfile
-import torch
 import time
 from unittest.mock import Mock
 from types import SimpleNamespace
+from typing import Any
+
+try:
+    import pytest  # type: ignore
+except Exception:
+    pytest = None
+
+HAS_TORCH = True
+try:
+    import torch as _torch  # type: ignore
+    torch: Any = _torch
+except Exception:
+    HAS_TORCH = False
+    torch = object()
+
+HAS_ETCD3 = True
+try:
+    import etcd3 as _etcd3  # type: ignore
+    etcd3: Any = _etcd3
+except Exception:
+    HAS_ETCD3 = False
+    etcd3 = object()
+
+if pytest is not None and (not HAS_TORCH or not HAS_ETCD3):
+    pytest.skip("Requires torch and etcd3; skipping metadata recovery tests.", allow_module_level=True)
 
 # 导入要测试的模块
 from distributed_kv_manager import init_engine, destroy_engine, should_store, should_retrieve, store_kv, retrieve_kv
@@ -87,12 +111,13 @@ def test_metadata_recovery_from_storage():
             # 创建隐藏状态
             hidden_states = torch.randn(seq_len, hidden_size)
             
-            # 创建KV缓存
+            # 创建KV缓存（包含 batch 维度）
             kv_caches = []
+            batch_size = 1
             for _ in range(num_layers):
-                k_cache = torch.randn(seq_len, num_heads, head_size)
-                v_cache = torch.randn(seq_len, num_heads, head_size)
-                kv_cache = torch.stack([k_cache, v_cache], dim=0)
+                k_cache = torch.randn(batch_size, seq_len, num_heads, head_size)
+                v_cache = torch.randn(batch_size, seq_len, num_heads, head_size)
+                kv_cache = torch.stack([k_cache, v_cache], dim=0)  # [2, B, S, H, D]
                 kv_caches.append(kv_cache)
             
             # 创建模型输入
@@ -269,8 +294,8 @@ def test_metadata_recovery():
             # 创建新的KV缓存用于检索
             new_kv_caches = []
             for _ in range(num_layers):
-                k_cache = torch.zeros(seq_len, num_heads, head_size)
-                v_cache = torch.zeros(seq_len, num_heads, head_size)
+                k_cache = torch.zeros(1, seq_len, num_heads, head_size)
+                v_cache = torch.zeros(1, seq_len, num_heads, head_size)
                 kv_cache = torch.stack([k_cache, v_cache], dim=0)
                 new_kv_caches.append(kv_cache)
             

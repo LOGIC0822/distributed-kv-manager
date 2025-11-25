@@ -1,9 +1,33 @@
 import os
 import tempfile
-import torch
 import time
 from unittest.mock import Mock
 from types import SimpleNamespace
+from typing import Any
+
+try:
+    import pytest  # type: ignore
+except Exception:
+    pytest = None
+
+HAS_TORCH = True
+try:
+    import torch as _torch  # type: ignore
+    torch: Any = _torch
+except Exception:
+    HAS_TORCH = False
+    torch = object()
+
+HAS_ETCD3 = True
+try:
+    import etcd3 as _etcd3  # type: ignore
+    etcd3: Any = _etcd3
+except Exception:
+    HAS_ETCD3 = False
+    etcd3 = object()
+
+if pytest is not None and (not HAS_TORCH or not HAS_ETCD3):
+    pytest.skip("Requires torch and etcd3; skipping cleanup test.", allow_module_level=True)
 
 # 导入要测试的模块
 from distributed_kv_manager import init_engine, destroy_engine, should_store, should_retrieve, store_kv, retrieve_kv

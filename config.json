@@ -1,15 +1,24 @@
 {
   "kv_transfer_config": {
-    "storage_type": "local",
+    "use_v1": true,
+    "storage_type": "v1_layered",
     "storage_dir": "/kvcache",
     "etcd_endpoints": ["127.0.0.1:2379"],
     "enable_ssd_caching": false,
     "ssd_cache_dir": "/tmp/ssd_cache",
     "enable_prefetch": true,
+    "v1_prefetch_top_k": 10,
+    "cache_mode": "none",
+    "mem_cache_capacity_gb": 8,
     "kv_expire_time": 86400,
     "cleanup_interval": 3600,
     "crail_dir": "./crail_kvcache",
-    "local_dir": "/kvcache"
+    "local_dir": "/kvcache_v1/local",
+    "dkv_storage_path": "/kvcache/v1",
+    "store_after_prefill": true,
+    "remote_dir": "/kvcache_v1/remote",
+    "remote_backend_type": "local",
+    "layer_split_front": -1
   },
   "rank": 0,
   "local_rank": 0

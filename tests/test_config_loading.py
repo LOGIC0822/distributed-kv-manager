@@ -1,6 +1,8 @@
-import torch
+try:
+    import torch  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None  # type: ignore
 from distributed_kv_manager import init_engine, destroy_engine, load_config_from_json
-from distributed_kv_manager.engine import StoreStatus, RetrieveStatus
 from distributed_kv_manager.storage.factory import StorageFactory
 
 def test_config_loading():
@@ -18,46 +20,27 @@ def test_config_loading():
     
     # 测试存储工厂
     print("\n=== 测试存储工厂 ===")
-    try:
-        storage = StorageFactory.create_storage(config)
-        print(f"存储实例创建成功: {type(storage).__name__}")
-        
-        # 测试存储功能
-        test_data = b"test data for storage"
-        test_file = "test_config_file.txt"
-        
-        # 上传测试
-        upload_success = storage.upload(test_file, test_data)
-        print(f"上传测试结果: {'成功' if upload_success else '失败'}")
-        
-        # 存在性测试
-        exists = storage.exists(test_file)
-        print(f"文件存在性检查: {'存在' if exists else '不存在'}")
-        
-        # 下载测试
-        if exists:
-            downloaded_data = storage.download(test_file)
-            print(f"下载测试结果: {'成功' if downloaded_data else '失败'}")
-            if downloaded_data:
-                print(f"数据一致性检查: {'一致' if downloaded_data == test_data else '不一致'}")
-        
-        # 删除测试文件
-        if hasattr(storage, 'delete'):
-            storage.delete(test_file)
-            print("测试文件已清理")
-            
-    except Exception as e:
-        print(f"存储实例创建或测试失败: {e}")
+    storage = StorageFactory.create_storage(config)
+    assert storage is not None
+    test_data = b"test data for storage"
+    test_file = "test_config_file.txt"
+    assert storage.upload(test_file, test_data)
+    assert storage.exists(test_file)
+    downloaded_data = storage.download(test_file)
+    assert downloaded_data == test_data
+    if hasattr(storage, 'delete'):
+        storage.delete(test_file)
     
-    # 初始化引擎
+    # 初始化引擎（若缺少 torch，跳过此段）
+    if torch is None:
+        return
+
     print("\n=== 测试引擎初始化 ===")
+    engine = init_engine(config)
     try:
-        engine = init_engine(config)
         print(f"引擎初始化成功: {type(engine).__name__}")
-        
-        # 检查存储实例
         print(f"引擎存储实例类型: {type(engine._storage).__name__}")
-        
+
         # 构造测试数据
         seq_len = 3
         num_layers = 2
@@ -68,7 +51,6 @@ def test_config_loading():
         kv_caches = [torch.randn(2, seq_len, num_heads, head_size) for _ in range(num_layers)]
         hidden_states = torch.randn(seq_len, 8)
 
-        # 模拟 model_input
         class ModelInput:
             def __init__(self, input_tokens, hidden_states):
                 self.input_tokens = input_tokens
@@ -80,17 +62,11 @@ def test_config_loading():
                 })()
 
         model_input = ModelInput(input_tokens, hidden_states)
-        
-        # 测试should_store方法
         store_status = engine.should_store(model_input)
-        print(f"Should store状态: {store_status}")
-        
-        # 清理引擎
+        assert store_status is not None
+    finally:
         destroy_engine()
         print("引擎已销毁")
-        
-    except Exception as e:
-        print(f"引擎初始化或测试失败: {e}")
     
     print("\n=== 测试完成 ===")
 

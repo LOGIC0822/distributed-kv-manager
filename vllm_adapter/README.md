@@ -18,6 +18,25 @@ Note: This replaces the `factory.py` under `kv_connector/`. Back up the original
 
 The files should be placed at the following path inside your vLLM installation:
 
+## Startup Modes with vLLM
+
+You can run with either the legacy inject style (v0) or the direct v1 API.
+
+- v0 (inject):
+  ```bash
+  python3 vllm_adapter/vllm_start_with_inject.py \
+    --model /tmp/ckpt --port 8100 --max-model-len 10000 \
+    --kv-transfer-config '{"kv_connector":"DistributedKVConnector","kv_role":"kv_both"}'
+  ```
+
+- v1 (direct):
+  ```bash
+  python3 -m vllm.entrypoints.openai.api_server \
+    --model /tmp/ckpt/Qwen3-0.6B --port 8100 --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"DKVOffloadingConnector","kv_connector_module_path":"distributed_kv_manager.vllm_adapter.dkv_offloading_connector_v1","kv_role":"kv_both"}'
+  ```
+
 ```
 vllm/
 └── vllm/

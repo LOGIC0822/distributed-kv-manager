@@ -18,6 +18,25 @@
 
 复制后的目录结构应如下所示：
 
+## 与 vLLM 的启动方式
+
+支持两种方式：旧版注入 (v0) 与新版直接启动 (v1)。
+
+- v0（注入脚本）：
+  ```bash
+  python3 vllm_adapter/vllm_start_with_inject.py \
+    --model /tmp/ckpt --port 8100 --max-model-len 10000 \
+    --kv-transfer-config '{"kv_connector":"DistributedKVConnector","kv_role":"kv_both"}'
+  ```
+
+- v1（直接启动）：
+  ```bash
+  python3 -m vllm.entrypoints.openai.api_server \
+    --model /tmp/ckpt/Qwen3-0.6B --port 8100 --max-model-len 10000 \
+    --gpu-memory-utilization 0.8 \
+    --kv-transfer-config '{"kv_connector":"DKVOffloadingConnector","kv_connector_module_path":"distributed_kv_manager.vllm_adapter.dkv_offloading_connector_v1","kv_role":"kv_both"}'
+  ```
+
 ```
 vllm/
 └── vllm/

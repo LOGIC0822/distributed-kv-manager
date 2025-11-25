@@ -142,6 +142,86 @@ engine = init_engine()
 
 ### Storage Configuration (Basic)
 
+Supported storage configuration fields under `kv_transfer_config`:
+
+- `storage_type` (str)
+  - `"local"`: use `LocalStorage(local_dir)` (filesystem backend).
+  - `"crail"`: use `CrailStorage(crail_dir)` (distributed storage).
+  - `"composite"`: use `CompositeStorage(local_backend, remote_backend, ...)` to split layers between local and remote.
+  - `"v1_layered"`: v1-only layered layout; remote backend persists all layers, local backend caches only the first `layer_split_front` layers (per-layer safetensors). Use `layer_split_front = -1` to cache all layers locally.
+
+- `storage_dir` (str)
+  - Logical root directory for KV files, typically aligned with `local_dir`.
+
+- `local_dir` (str)
+  - Root directory for local storage (required when `storage_type="local"`).
+
+- `crail_dir` (str)
+  - Root directory for Crail storage; used when `storage_type="crail"` or as composite's remote default.
+
+- `remote_dir` (str, optional)
+  - Root directory for remote storage in composite mode; falls back to `crail_dir` if omitted.
+
+- `remote_backend_type` / `remote_storage_type` (str, optional)
+  - Remote backend type in composite mode:
+    - `"noop"` / `"none"`: placeholder backend (no real persistence).
+    - `"local"`: remote side is also `LocalStorage(remote_dir)`.
+    - `"crail"`: remote side is `CrailStorage(remote_dir)`.
+    - Any dotted path (e.g. `"my_pkg.my_mod.MyBackend"`): dynamically imported class.
+
+- `remote_backend_class` (str, optional)
+  - Explicit class path for remote backend, e.g. `"my_pkg.my_mod.MyStorage"`. Takes precedence over `remote_backend_type`.
+
+- `layer_split_front` (int, optional)
+  - In composite mode, number of front layers stored locally.
+
+- `layer_split_ratio` (float, optional, default `0.5`)
+  - In composite mode, ratio of front layers stored locally when `layer_split_front` is not set.
+
+- `directory_layout` (str, optional, default `"flat"`)
+  - `"hash"`, `"hash2"`, `"hash_bucket"`: enable hash-bucket directory mapping (`MappedStorage(HashBucketPathMapper)`).
+  - Other values: keep a flat directory layout.
+
+- `dkv_storage_path` (str, v1 only, optional)
+  - Root directory for v1 external KV storage. If not set, v1 falls back to `storage_dir/local_dir` or `/tmp/kvcache/v1`.
+
+- `enable_ssd_caching` (bool)
+  - Legacy flag: when true and `cache_mode` is not set, wraps base storage with `CachingStorage(base, ssd_cache_dir, ...)`.
+
+- `cache_mode` (str, optional)
+  - `"none"`: no caching, return base storage as-is.
+  - `"only_mem"`: in-memory LRU cache only, no SSD.
+  - `"mem_and_ssd"`: two-level cache (memory + SSD).
+
+- `ssd_cache_dir` (str, optional, default `"/tmp/ssd_cache"`)
+  - Root directory for SSD cache files.
+
+- `mem_cache_capacity_bytes` (int, optional, default `256 * 1024 * 1024`)
+  - Capacity of the in-memory cache in bytes.
+
+- `enable_prefetch` (bool, optional, default `true`)
+  - Whether to enable prefetching logic inside `CachingStorage`.
+
+- `etcd_endpoints` (list[str])
+  - ETCD cluster endpoints used by v0 KVEngine for metadata.
+
+- `kv_expire_time` (int, seconds)
+  - TTL for KV entries; used by cleanup manager.
+
+- `cleanup_interval` (int, seconds)
+  - Interval for background cleanup scans.
+
+- `store_after_prefill` (bool)
+  - For v0: whether to store KV immediately after prefill.
+
+- `v1_storage_mode` (str, optional)
+  - Reserved for v1 layered modes (e.g. `"layered"`). Current v1 safetensors-based path does not use it yet.
+
+- `enable_debug_dump` / `debug_dump_file`
+  - Whether to enable debug dump for KV/metadata and where to write it.
+
+Examples:
+
 - Local only:
   ```json
   {"kv_transfer_config": {"storage_type": "local", "local_dir": "/tmp/kvcache"}}
@@ -150,6 +230,77 @@ engine = init_engine()
   ```json
   {"kv_transfer_config": {"storage_type": "crail", "crail_dir": "/crail/kvcache"}}
   ```
+- V1 layered (front 16 layers cached locally, all layers persisted remotely):
+  ```json
+  {"kv_transfer_config": {
+    "storage_type": "v1_layered",
+    "local_dir": "/data/kvcache_v1/local",
+    "remote_dir": "/data/kvcache_v1/remote",
+    "remote_backend_type": "local",
+    "layer_split_front": 16
+  }}
+  ```
+
+### V1 External KV Storage
+
+The v1 engine stores KV as per-layer safetensors under a configurable root directory:
+
+- Root directory:
+  - `dkv_storage_path` controls the v1 external KV root.
+  - If not set on `vllm_config.kv_transfer_config`, v1 falls back to `config.json.kv_transfer_config.dkv_storage_path`, then `storage_dir/local_dir`, and finally `/tmp/kvcache/v1`.
+- File layout:
+  - For each request, v1 hashes the prompt tokens (and optional multimodal hashes) into a folder name: `<prompt_hash> = md5(prompt_token_ids_bytes [+ mm_hashes])`.
+  - Files are written as: `dkv_storage_path/<prompt_hash>/model.layers.<N>.self_attn.attn.safetensors` (one file per attention layer).
+- Caching / composite support:
+  - V1 delegates to `StorageFactory.create_storage`, so all existing options (`storage_type`, `composite`, `cache_mode`, `enable_ssd_caching`, `directory_layout`, etc.) still apply to the v1 path.
+
+#### V1 Mode Switch + DRAM Hash Cache
+
+- `use_v1` (bool): When `true`, v1-specific behavior is enabled across the stack.
+  - The storage backend returned by the factory is wrapped with a v1-only DRAM cache: `V1HashCachedStorage`.
+  - The LRU eviction unit is a full prompt hash directory (group of safetensors), not per-file.
+  - This wrapper is independent of the legacy `CachingStorage` and remains active even when `cache_mode: "none"`.
+
+- DRAM capacity setting (prefer GB):
+  - `mem_cache_capacity_gb` (float/int, preferred) → converted to bytes.
+  - `mem_cache_capacity_bytes` (int, fallback) → kept for backward compatibility.
+
+- Etcd-only hit/miss semantics:
+  - Existence check uses etcd metadata only. If etcd is down/unavailable, v1 treats it as a miss and does not scan the filesystem.
+  - After a STORE, a single aggregate metadata entry is written per hash directory (`status=1`, refreshed `last_access`).
+
+- Recommended minimal config for v1 hash-group DRAM caching:
+  ```json
+  {
+    "kv_transfer_config": {
+      "use_v1": true,
+      "storage_type": "v1_layered",
+      "local_dir": "/kvcache_v1/local",
+      "remote_dir": "/kvcache_v1/remote",
+      "remote_backend_type": "local",
+      "layer_split_front": -1,
+      "dkv_storage_path": "/kvcache/v1",
+      "cache_mode": "none",
+      "mem_cache_capacity_gb": 0.25,
+      "etcd_endpoints": ["127.0.0.1:2379"],
+      "kv_expire_time": 86400
+    }
+  }
+  ```
+
+#### V1 Prefetch
+
+- `enable_prefetch` (bool): enables prefetch at engine init for v1.
+- `v1_prefetch_top_k` (int): prefetches top-K hashes by `last_access` (from etcd) into DRAM.
+- Expected logs on startup (when enabled):
+  - `[v1_engine] scheduled initial v1 prefetch for top_k=K hashes`
+  - `[v1_engine] prefetch: top_k=K, actual=X`
+
+Testing quick recipe:
+- Clear previous state: `python3 scripts/clear_kv_store.py --yes`
+- Run a long request once to populate files + metadata.
+- Restart server with `use_v1: true`, `cache_mode: "none"`, and a small `mem_cache_capacity_gb` if you want to observe eviction.
+- Watch logs for prefetch lines above; DRAM hits then come from `V1HashCachedStorage`.
 
 ### Composite Storage Configuration
 
@@ -239,11 +390,22 @@ from distributed_kv_manager import should_store, store_kv, should_retrieve, retr
 # Initialize the engine
 engine = init_engine(config)
 
+# Prepare optional hidden/intermediate states captured from the model output.
+# This is required when you expect full bypass on a cache hit.
+hidden_states = hidden_or_intermediate_states_from_model_output(...)
 
 # Store KV cache if needed
 if store_status == StoreStatus.STORED:
-    store_kv(model_config, parallel_config, transfer_config,
-             model_executable, model_input, kv_caches, store_status)
+    store_kv(
+        model_config,
+        parallel_config,
+        transfer_config,
+        model_executable,
+        model_input,
+        kv_caches,
+        store_status,
+        hidden_or_intermediate_states=hidden_states,
+    )
 
 # Check if we can retrieve KV cache
 retrieve_status = should_retrieve(model_input)
@@ -342,15 +504,28 @@ nohup ./etcd \
 - Then start the vLLM OpenAI-compatible server with this connector (v0 API):
 
 ```bash
-VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+python3 vllm_adapter/vllm_start_with_inject.py \
   --model /tmp/ckpt/Qwen --port 8100 --max-model-len 10000 \
   --gpu-memory-utilization 0.8 \
   --kv-transfer-config '{"kv_connector":"DistributedKVConnector","kv_role":"kv_both"}'
 
-VLLM_USE_V1=0 python3 -m vllm.entrypoints.openai.api_server \
+python3 vllm_adapter/vllm_start_with_inject.py \
   --model /tmp/ckpt/Qwen3-0.6B --port 8100 --max-model-len 10000 \
   --gpu-memory-utilization 0.8 \
   --kv-transfer-config '{"kv_connector":"DistributedKVConnector","kv_role":"kv_both"}'
+
+- Or start directly with the v1 API (no inject script needed):
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+  --model /tmp/ckpt/Qwen3-0.6B --port 8100 --max-model-len 10000 \
+  --gpu-memory-utilization 0.8 \
+  --kv-transfer-config '{"kv_connector":"DKVOffloadingConnector","kv_connector_module_path":"distributed_kv_manager.vllm_adapter.dkv_offloading_connector_v1","kv_role":"kv_both"}'
+```
+
+Note: `kv_connector_module_path` ensures vLLM imports the connector from
+`distributed_kv_manager.vllm_adapter.dkv_offloading_connector_v1` even if a
+same-name connector exists in vLLM. Keep it when running outside editable dev.
 ```
 
 - Simple requests to test:
@@ -537,4 +712,4 @@ Note: the legacy top‑level module `distributed_kv_manager/prefetch.py` was rem
 - Adaptive layer split based on access latency & hit rates
 - Dynamic prefetch budgeting (utilization feedback loop)
 - Extended telemetry export (prometheus hooks)
-- Additional remote backends (S3, NFS, OSS) via dynamic import
+- Additional remote backends (AS13000, Crail) via dynamic import
