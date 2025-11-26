@@ -66,7 +66,7 @@ RUN mkdir -p /root/etcd && \
     rm etcd-v3.6.4-linux-amd64.tar.gz
 RUN mkdir -p /tmp/etcd-data
 
-RUN git clone -b main https://github.com/Yan-tx/distributed-kv-manager.git /root/distributed_kv_manager
+RUN git clone -b dev https://github.com/Yan-tx/distributed-kv-manager.git /root/distributed_kv_manager
 
 # 构建 Rust 扩展模块
 # RUN cd /root/distributed_kv_manager/rust_extensions/kv_serializer && cargo build --release
