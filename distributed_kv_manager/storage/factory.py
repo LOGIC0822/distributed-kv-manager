@@ -5,6 +5,7 @@ import importlib
 from .base import AbstractStorage
 from .crail_storage import CrailStorage
 from .local_storage import LocalStorage
+from .dram_storage import MemoryStorage
 from .caching_storage import CachingStorage
 from .composite_storage import CompositeStorage
 from .path_mapper import HashBucketPathMapper, MappedStorage
@@ -200,6 +201,22 @@ class StorageFactory:
                 remote_backend = MappedStorage(remote_backend, mapper)
 
             base_storage = V1LayeredStorage(local_backend, remote_backend, layer_split_front=front_n)
+        
+        elif stype == "memory" or stype == "dram":
+            # 纯内存存储，模拟“内存盘”
+            # 容量直接复用上面已经解析好的 mem_capacity_bytes
+            
+            base_latency_ms = float(_get("mem_storage_base_latency_ms", 0.0))
+            bandwidth_MBps = _get("mem_storage_bandwidth_MBps", None)
+
+            base_storage = MemoryStorage(
+                capacity_bytes=mem_capacity_bytes,
+                base_latency_ms=base_latency_ms,
+                bandwidth_MBps=bandwidth_MBps,
+            )
+
+            # 内存盘再套一层 CachingStorage 就毫无意义了，这里可以主动关掉
+            enable_caching = False
 
         else:
             raise ValueError(f"Unsupported storage type: {storage_type}")

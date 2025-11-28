@@ -1,7 +1,7 @@
 {
   "kv_transfer_config": {
     "use_v1": true,
-    "storage_type": "v1_layered",
+    "storage_type": "memory",
     "storage_dir": "/kvcache",
     "etcd_endpoints": ["127.0.0.1:2379"],
     "enable_ssd_caching": false,
