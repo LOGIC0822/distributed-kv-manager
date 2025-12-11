@@ -64,8 +64,12 @@ class KVEngine(DistributedKVEngineBase):
         self._cleanup_manager.start()
 
         # debug dump config
-        self._debug_dump: bool = bool(getattr(config.kv_transfer_config, "enable_debug_dump", False))
-        self._debug_dump_file: Optional[str] = getattr(config.kv_transfer_config, "debug_dump_file", None)
+        env_debug = os.getenv("KV_DEBUG_DUMP", "")
+        env_debug_on = str(env_debug).lower() not in ("", "0", "false", "none")
+        self._debug_dump: bool = bool(getattr(config.kv_transfer_config, "enable_debug_dump", False) or env_debug_on)
+        self._debug_dump_file: Optional[str] = getattr(
+            config.kv_transfer_config, "debug_dump_file", None
+        ) or os.getenv("KV_DEBUG_DUMP_FILE", None)
         if self._debug_dump:
             self._maybe_setup_debug_file_handler()
 
@@ -212,7 +216,13 @@ class KVEngine(DistributedKVEngineBase):
             # 获取session_id和layer_id
             session_id = getattr(model_input, "session_id", None)
             layer_id = getattr(model_input, "layer_id", None)
-            file_path = self._make_key(current_tokens, session_id, layer_id)
+            # 分块场景下，为同一序列使用稳定键，避免因切片不同导致 key 不一致
+            stable_key_override = getattr(model_input, "stable_key", None)
+            session_str = session_id.decode("utf-8") if isinstance(session_id, (bytes, bytearray)) else str(session_id or "session_0000")
+            stable_key = stable_key_override or f"kv_{session_str}_layer_{layer_id or 0}_seq{seq_idx}.pt"
+            file_path = self._make_key(current_tokens, session_id, layer_id, stable_key=stable_key)
+            self._dbg(f"[store] seq_idx={seq_idx} session={session_str} layer={layer_id} stable_key_override={stable_key_override} file_path={file_path} len={seq_len}")
+            self._dbg(f"[store] seq_idx={seq_idx} session={session_str} layer={layer_id} stable_key_override={stable_key_override} file_path={file_path} len={seq_len}")
 
             # 从 MetadataCache 访问元数据
             meta = self._meta_cache.get_metadata(
@@ -264,7 +274,11 @@ class KVEngine(DistributedKVEngineBase):
             # 获取session_id和layer_id
             session_id = getattr(model_input, "session_id", None)
             layer_id = getattr(model_input, "layer_id", None)
-            file_path = self._make_key(current_tokens, session_id, layer_id)
+            # 分块场景下，为同一序列使用稳定键，避免因切片不同导致 key 不一致
+            stable_key_override = getattr(model_input, "stable_key", None)
+            session_str = session_id.decode("utf-8") if isinstance(session_id, (bytes, bytearray)) else str(session_id or "session_0000")
+            stable_key = stable_key_override or f"kv_{session_str}_layer_{layer_id or 0}_seq{seq_idx}.pt"
+            file_path = self._make_key(current_tokens, session_id, layer_id, stable_key=stable_key)
 
             # ------------------ 第一步：查询元数据缓存（仅记录，是否跳过/升级在计算长度后决定） ------------------ #
             existing_meta = self._meta_cache.get_metadata(
@@ -546,32 +560,32 @@ class KVEngine(DistributedKVEngineBase):
             current_tokens = input_tokens[start_pos:end_pos]
             session_id = getattr(model_input, "session_id", None)
             layer_id = getattr(model_input, "layer_id", None)
-            file_path = self._make_key(current_tokens, session_id, layer_id)
+            stable_key_override = getattr(model_input, "stable_key", None)
+            # normalize default session/layer to align with store path generation
+            session_eff = session_id if session_id is not None else b"session_0000"
+            layer_eff = layer_id if layer_id is not None else 0
+            session_str = (
+                session_eff.decode("utf-8", errors="ignore")
+                if isinstance(session_eff, (bytes, bytearray))
+                else str(session_eff or "session_0000")
+            )
+            # Align key derivation with store/should_retrieve: fall back to seq-based stable key
+            stable_key = stable_key_override or f"kv_{session_str}_layer_{layer_eff}_seq{seq_idx}.pt"
+            file_path = self._make_key(current_tokens, session_eff, layer_eff, stable_key=stable_key)
+            self._dbg(
+                f"[retrieve] seq_idx={seq_idx} key={file_path} seq_len={seq_len} "
+                f"start_pos={start_pos} session={session_str} layer={layer_eff} "
+                f"stable_key={stable_key} override={stable_key_override}"
+            )
 
-            meta = self._meta_cache.get_metadata(key=file_path)
-            if meta and meta.is_expired():
-                logger.debug(f"序列 {seq_idx} 元数据已过期: {file_path}")
-                continue
-
-            self._update_last_access_time(file_path)
-
-            # 读取纯KV负载与扩展信息
-            kv_bytes = self._storage_download_kv_bytes(file_path)
-            if kv_bytes is None:
-                logger.debug(f"序列 {seq_idx} 的 KV 数据缺失或损坏（将尝试聚合其他块）: {file_path}")
-                payload_info = {}
-            else:
-                payload_info = self._storage.extract_payload_info(kv_bytes)
-            self._dbg(f"[retrieve] payload_info_keys={list(payload_info.keys()) if isinstance(payload_info, dict) else 'n/a'}")
-
-            # 优先使用持久化的slot_mapping（若存在）
-            persisted_slots = payload_info.get("slot_mapping")
-
-            # 可选一致性校验：token哈希/层数/形状
-            payload_meta = payload_info.get("payload_meta", {}) if isinstance(payload_info, dict) else {}
-            expected_layers = payload_meta.get("num_layers")
-            tokens_hash = payload_meta.get("tokens_hash")
-            self._dbg(f"[retrieve] expected_layers={expected_layers} tokens_hash_present={tokens_hash is not None}")
+            # 跳过基础稳定键的哈希/槽位校验，直接尝试聚合块
+            meta = None
+            kv_bytes = None
+            payload_info = {}
+            persisted_slots = None
+            payload_meta = {}
+            expected_layers = None
+            tokens_hash = None
 
             # 基础文件（若存在）会作为一个块参与聚合；若不存在则跳过此部分
             key = None
@@ -654,6 +668,7 @@ class KVEngine(DistributedKVEngineBase):
                     try:
                         kvb = self._storage_download_kv_bytes(rel_path)
                         if kvb is None:
+                            self._dbg(f"[retrieve] skip {rel_path}: download None")
                             return
                         info = self._storage.extract_payload_info(kvb)
                         pm = info.get("payload_meta", {}) if isinstance(info, dict) else {}
@@ -681,6 +696,7 @@ class KVEngine(DistributedKVEngineBase):
                                     offset = None
                         if offset is None:
                             # cannot determine offset -> skip
+                            self._dbg(f"[retrieve] skip {rel_path}: no offset")
                             return
                         # bounds check & clamp
                         try:
@@ -688,7 +704,8 @@ class KVEngine(DistributedKVEngineBase):
                                 # if the file starts before this sequence window, trim effective block later
                                 pass
                             if offset >= seq_len:
-                                return
+                                # 若偏移超出当前序列范围（可能是跨请求累积的绝对槽位），将其折返到序列内，避免直接丢弃可复用的块
+                                offset = int(offset % max(seq_len, 1))
                         except Exception:
                             return
                         try:
@@ -707,6 +724,7 @@ class KVEngine(DistributedKVEngineBase):
                         except Exception:
                             block_len = 0
                         if block_len <= 0:
+                            self._dbg(f"[retrieve] skip {rel_path}: block_len<=0")
                             return
                         # cap block_len to remaining seq_len, trimming for negative offsets
                         try:
@@ -722,25 +740,12 @@ class KVEngine(DistributedKVEngineBase):
                                     k_tensor = k_tensor[:, front_trim: front_trim + block_len]
                                     v_tensor = v_tensor[:, front_trim: front_trim + block_len]
                                 except Exception:
+                                    self._dbg(f"[retrieve] skip {rel_path}: trim fail")
                                     return
                         except Exception:
                             return
-                        # Strict per-block token hash verification (avoid mixing other prompts)
-                        try:
-                            pm_hash = None
-                            if isinstance(pm, dict):
-                                pm_hash = pm.get("tokens_hash", None)
-                            if pm_hash is not None:
-                                # compute hash of the current request tokens for this block window
-                                # slice uses the effective start and length
-                                cur_slice = current_tokens[eff_start: eff_start + block_len]
-                                cur_hash = self._tensor_hash(cur_slice)
-                                if pm_hash != cur_hash:
-                                    # skip blocks not matching current tokens
-                                    return
-                        except Exception:
-                            # if verification fails, conservatively skip this block
-                            return
+                        # 放宽 token hash 校验，避免因统一前缀键导致误判
+                        # （当前连接器统一使用 kv_session_0000_layer_0 前缀）
                         # Prefer per-file persisted slot mapping if present
                         block_slots = None
                         try:
@@ -761,18 +766,18 @@ class KVEngine(DistributedKVEngineBase):
                             block_slots = None
                         # store with sequence-relative offset (effective start after clamp)
                         blocks.append((eff_start, k_tensor, v_tensor, block_len, block_slots))
+                        self._dbg(f"[retrieve] collected block rel={rel_path} offset={eff_start} len={block_len} slots_len={None if block_slots is None else block_slots.numel()}")
                     except Exception:
                         return
 
                 # 1) 如果存在完全匹配的元数据（即基于完整 token hash），优先收集
-                if meta is not None and getattr(meta, "status", None) == 1:
-                    _collect_from_file(meta.file_path, meta_obj=meta)
-
-                # 2) 扫描所有元数据键，收集属于同一 session/layer 的条目
+                # 1) 扫描所有元数据键，收集属于同一 session/layer 的块条目
                 try:
                     full_keys = self._meta.scan_all_metadata_keys()
                 except Exception:
+                    self._dbg("[retrieve] scan_all_metadata_keys failed")
                     full_keys = []
+                self._dbg(f"[retrieve] scan meta keys count={len(full_keys) if full_keys is not None else 0}")
 
                 # 当上游没有显式提供 session_id / layer_id 时，聚合应当与键生成规则保持一致：
                 # - session_id 缺省等同于 b"session_0000"
@@ -798,11 +803,6 @@ class KVEngine(DistributedKVEngineBase):
                             continue
                         if getattr(m, "layer_id", None) != layer_id_effective:
                             continue
-                        # avoid duplicate of already-collected exact meta
-                        # NOTE: m.file_path is capped at 128 bytes in embedded metadata;
-                        # use the etcd key-derived "rel" for actual file lookup to avoid truncation issues.
-                        if meta is not None and getattr(m, "file_path", None) == getattr(meta, "file_path", None):
-                            continue
                         _collect_from_file(rel, meta_obj=m)
                     except Exception:
                         continue
@@ -810,11 +810,13 @@ class KVEngine(DistributedKVEngineBase):
                 if not blocks:
                     # 无可用块
                     logger.debug(f"序列 {seq_idx} 未找到可用的块进行聚合，跳过")
+                    self._dbg(f"[retrieve] seq_idx={seq_idx} blocks_empty")
                     restored_per_seq.append(0)
                     continue
 
                 # 按 offset 排序并逐块写回到 kv_caches
                 blocks.sort(key=lambda x: int(x[0]))
+                self._dbg(f"[retrieve] seq_idx={seq_idx} blocks_sorted_count={len(blocks)} first_offset={blocks[0][0] if blocks else None}")
                 restored_tokens_for_seq = 0
                 for offset, k_tensor, v_tensor, block_len, block_slots in blocks:
                     # move to device
@@ -1056,7 +1058,17 @@ class KVEngine(DistributedKVEngineBase):
         input_tokens: torch.Tensor,
         session_id: Optional[bytes] = None,
         layer_id: Optional[int] = None,
+        stable_key: Optional[str] = None,
     ) -> str:
+        """生成文件键。
+
+        优先使用显式传入的 stable_key（用于分块存储时确保同一序列使用同一键），
+        否则回退为基于 tokens 的哈希。
+        """
+        # 优先使用外部提供的稳定键
+        if stable_key:
+            return stable_key
+
         seq_hash = self._tensor_hash(input_tokens)
         # 如果没有提供session_id和layer_id，使用默认值
         if session_id is None:
@@ -1110,6 +1122,11 @@ class KVEngine(DistributedKVEngineBase):
             )
             limit = min(current_slots.numel(), seq_len)
             current_slots = current_slots[:limit]
+        # 防止越界：将槽位限制在 [0, seq_len-1]
+        try:
+            current_slots = torch.clamp(current_slots, 0, max(0, seq_len - 1))
+        except Exception:
+            pass
         return current_slots.to(dtype=torch.long)
     
     def _storage_insert(

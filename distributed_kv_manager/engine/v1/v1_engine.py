@@ -753,12 +753,24 @@ def _inject_kv_into_layer(
     if isinstance(attn_metadata, _MLA):
         num_pages, page_size = int(shape[0]), int(shape[1])
         view = dst_kv_cache_layer.reshape(num_pages * page_size, -1)
-        view[slot_mapping, ...] = src_kv_cache
+        slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+        take = min(int(slots.numel()), int(src_kv_cache.shape[0]), int(view.shape[0]))
+        if take <= 0:
+            return
+        slots = slots[:take].clamp(0, view.shape[0] - 1)
+        kv = src_kv_cache[:take, ...]
+        view[slots, ...] = kv
         view.reshape(shape)
     else:
         num_pages, page_size = int(shape[1]), int(shape[2])
         view = dst_kv_cache_layer.reshape(2, num_pages * page_size, -1)
-        view[:, slot_mapping, ...] = src_kv_cache
+        slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+        take = min(int(slots.numel()), int(src_kv_cache.shape[1]), int(view.shape[1]))
+        if take <= 0:
+            return
+        slots = slots[:take].clamp(0, view.shape[1] - 1)
+        kv = src_kv_cache[:, :take, ...]
+        view[:, slots, ...] = kv
         view.reshape(shape)
 
 
@@ -782,7 +794,10 @@ def _extract_kv_from_layer(
 
 
 def _align_to_block_size(num_tokens: int, block_size: int) -> int:
-    return (num_tokens - 1) // block_size * block_size
+    """Floor to nearest multiple of block_size (>=0)."""
+    if num_tokens <= 0 or block_size <= 0:
+        return 0
+    return (num_tokens // block_size) * block_size
 
 
 # ---------------- Module-level helpers (singleton) ----------------

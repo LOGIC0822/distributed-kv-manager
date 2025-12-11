@@ -22,6 +22,19 @@ else:
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+# 早期导入 connector 以验证路径，若失败则在 stderr 中记录
+try:
+    import distributed_kv_manager.vllm_adapter.distributed_kv_connector as _dkv_conn  # noqa: F401
+    sys.stderr.write("[vllm_start_with_inject] imported distributed_kv_connector\n")
+    try:
+        with open("/tmp/connector_debug.log", "a", encoding="utf-8") as _f:
+            _f.write("[vllm_start_with_inject] imported distributed_kv_connector\n")
+            _f.flush()
+    except Exception:
+        pass
+except Exception as _e:
+    sys.stderr.write(f"[vllm_start_with_inject] import distributed_kv_connector failed: {_e}\n")
+
 # Try to install our injector (best-effort)
 try:
     from vllm_adapter.inject_multi_block import inject
