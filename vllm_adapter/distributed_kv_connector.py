@@ -173,12 +173,15 @@ class DistributedKVConnector(KVConnectorBase):
                 full_hash = "nohash"
             session_norm = model_input.session_id.decode("utf-8", errors="ignore") if isinstance(model_input.session_id, (bytes, bytearray)) else str(model_input.session_id)
             layer_norm = model_input.layer_id if model_input.layer_id is not None else 0
-            base_key = f"kv_{session_norm}_layer_{layer_norm}_{full_hash}"
+            # 优先复用 recv 阶段注入的哈希基键，确保跨 chunk 共享同一 stable_key
+            base_key = getattr(model_input, "_dkv_base_key", None)
+            if not base_key:
+                base_key = f"kv_{session_norm}_layer_{layer_norm}_{full_hash}"
+                try:
+                    model_input._dkv_base_key = base_key
+                except Exception:
+                    pass
             model_input.stable_key = f"{base_key}.pt"
-            try:
-                model_input._dkv_base_key = base_key
-            except Exception:
-                pass
             self._dbg(f"[connector] send prep session={model_input.session_id} layer={model_input.layer_id} stable_key={model_input.stable_key}")
         except Exception:
             pass
@@ -352,7 +355,8 @@ class DistributedKVConnector(KVConnectorBase):
                 "token_offset": block_global_offset,
                 "block_index": int(blk_idx),
                 "block_size": int(blk_len),
-                "total_tokens": int(seq_len),
+                # 存储侧的总长使用块长，避免 slot_mapping 与 seq_len 不匹配警告
+                "total_tokens": int(blk_len),
                 # 告诉引擎分块存储使用的稳定 key（包含块偏移），避免覆盖
                 "stable_key": block_file_key,
                 "base_stable_key": base_file_key,
@@ -411,15 +415,19 @@ class DistributedKVConnector(KVConnectorBase):
                     if isinstance(layer_id, str) and layer_id.lower() == "none":
                         layer_id = None
                     layer_norm = layer_id if layer_id is not None else 0
-                    # 优先使用 recv 阶段计算的稳定键（基于完整 tokens 哈希），确保分块同 key
-                    # 优先使用 recv 阶段计算的哈希基键，确保落盘/检索稳定
-                    engine_stable_key = getattr(model_input, "stable_key", None)
-                    if not engine_stable_key:
-                        base_key = getattr(model_input, "_dkv_base_key", None)
-                        if base_key:
-                            engine_stable_key = f"{base_key}.pt"
-                    if not engine_stable_key:
-                        engine_stable_key = f"kv_{session_norm}_layer_{layer_norm}_seq{seq_idx}.pt"
+                    # 优先使用 recv 阶段计算的哈希基键，确保落盘/检索稳定；若缺失则立即生成，避免回退到 seq 前缀导致覆盖
+                    base_key = getattr(model_input, "_dkv_base_key", None)
+                    if not base_key:
+                        try:
+                            full_hash = self.engine._tensor_hash(input_tokens)
+                        except Exception:
+                            full_hash = "nohash"
+                        base_key = f"kv_{session_norm}_layer_{layer_norm}_{full_hash}"
+                        try:
+                            model_input._dkv_base_key = base_key
+                        except Exception:
+                            pass
+                    engine_stable_key = f"{base_key}.pt"
                     stable_key = engine_stable_key  # 用同一键跟踪累计长度
                     prev_len_global = int(self._prefill_prev_len.get(stable_key, 0))
 
@@ -486,7 +494,7 @@ class DistributedKVConnector(KVConnectorBase):
                         blk_start_rel = max(0, blk_start_global - chunk_start)
                         blk_end_rel = blk_start_rel + blk_len
                         self._dbg(f"[connector-print] store_block blk_idx={blk_idx} blk_start_global={blk_start_global} blk_end_global={blk_end_global} blk_start_rel={blk_start_rel} blk_end_rel={blk_end_rel} token_offset_base={chunk_start}")
-                        _build_and_store_block(blk_idx, blk_start_rel, blk_end_rel, seq_idx, seq_len, start_pos_chunk, current_tokens, session_norm_bytes, layer_norm, engine_stable_key, chunk_start)
+                        _build_and_store_block(blk_idx, blk_start_rel, blk_end_rel, seq_idx, blk_len, start_pos_chunk, current_tokens, session_norm_bytes, layer_norm, engine_stable_key, chunk_start)
 
                     # 更新累积长度
                     self._prefill_prev_len[stable_key] = max(prev_len_global, chunk_end)

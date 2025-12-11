@@ -577,6 +577,10 @@ class KVEngine(DistributedKVEngineBase):
                 f"start_pos={start_pos} session={session_str} layer={layer_eff} "
                 f"stable_key={stable_key} override={stable_key_override}"
             )
+            # 用 stable_key 前缀约束块检索，避免不同输入之间互相聚合
+            stable_key_prefix = (
+                stable_key[:-3] if isinstance(stable_key, str) and stable_key.endswith(".pt") else stable_key
+            )
 
             # 跳过基础稳定键的哈希/槽位校验，直接尝试聚合块
             meta = None
@@ -802,6 +806,11 @@ class KVEngine(DistributedKVEngineBase):
                         if getattr(m, "session_id", None) != session_id_effective:
                             continue
                         if getattr(m, "layer_id", None) != layer_id_effective:
+                            continue
+                        # 额外按 stable_key 前缀过滤，防止不同输入的块混用
+                        if stable_key_prefix and not (
+                            rel == stable_key or str(rel).startswith(f"{stable_key_prefix}_blk")
+                        ):
                             continue
                         _collect_from_file(rel, meta_obj=m)
                     except Exception:
