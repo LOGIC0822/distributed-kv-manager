@@ -69,6 +69,19 @@ class V1HashDRAMCache:
             for _, data in files.items():
                 self._size -= len(data)
 
+    def delete(self, file_path: str) -> bool:
+        hid = self._hash_id(file_path)
+        with self._lock:
+            group = self._groups.get(hid)
+            if not group:
+                return False
+            data = group.pop(file_path, None)
+            if data is not None:
+                self._size -= len(data)
+            if not group:
+                self._groups.pop(hid, None)
+            return data is not None
+
 
 class V1HashCachedStorage(AbstractStorage):
     """基于 hash 目录的 DRAM 缓存封装，仅用于 v1 per-layer safetensors。
@@ -115,4 +128,13 @@ class V1HashCachedStorage(AbstractStorage):
         self, data: bytes
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self._backend.unpack_kv_data(data)
+
+    def delete(self, file_path: str) -> bool:  # type: ignore[override]
+        del_fn = getattr(self._backend, "delete", None)
+        ok = False
+        if callable(del_fn):
+            ok = bool(del_fn(file_path))
+        # 无论后端是否删除成功，都尝试清理缓存，避免返回过期数据
+        self._cache.delete(file_path)
+        return ok
 

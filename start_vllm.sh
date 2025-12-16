@@ -22,13 +22,24 @@ export KV_FORCE_CHUNKED_PREFILL=${KV_FORCE_CHUNKED_PREFILL:-1}
 export KV_MAX_NUM_BATCHED_TOKENS=${KV_MAX_NUM_BATCHED_TOKENS:-16}
 export KV_MAX_NUM_SEQS=${KV_MAX_NUM_SEQS:-4}
 
-# 为便于调试 v0（避免 inject 干扰），直接复用脚本启动 v0 原生服务
+export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 export KV_DEBUG_DUMP=${KV_DEBUG_DUMP:-1}
 export KV_DEBUG_DUMP_FILE=${KV_DEBUG_DUMP_FILE:-/tmp/kv_engine_debug.log}
-export PORT=${PORT:-8200}
-# 确保走 v0 分支
-export USE_VLLM_V1=0
-export VLLM_USE_V1=0
-export KV_FORCE_CHUNKED_PREFILL=${KV_FORCE_CHUNKED_PREFILL:-1}
+export VLLM_NO_USAGE_STATS=1
+export VLLM_LOG_LEVEL=${VLLM_LOG_LEVEL:-DEBUG}
 
-exec bash scripts/start_v0_native.sh
+if [[ "${USE_VLLM_V1}" == "1" ]]; then
+  export PORT=${PORT:-8100}
+  python -u -m vllm.entrypoints.openai.api_server \
+    --model /tmp/ckpt/Qwen3-0.6B \
+    --port "${PORT}" \
+    --max-model-len 512 \
+    --gpu-memory-utilization 0.7 \
+    --max-num-batched-tokens "${KV_MAX_NUM_BATCHED_TOKENS}" \
+    --max-num-seqs "${KV_MAX_NUM_SEQS}" \
+    --kv-transfer-config "${KV_JSON}" \
+    --disable-log-requests
+else
+  export PORT=${PORT:-8200}
+  exec bash scripts/start_v0_native.sh
+fi

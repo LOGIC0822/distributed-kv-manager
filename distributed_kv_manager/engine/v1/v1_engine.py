@@ -787,10 +787,22 @@ def _extract_kv_from_layer(
         _MLA = object  # type: ignore
 
     if isinstance(attn_metadata, _MLA):
-        num_pages, page_size = layer.shape[0], layer.shape[1]
-        return layer.reshape(num_pages * page_size, -1)[slot_mapping, ...]
-    num_pages, page_size = layer.shape[1], layer.shape[2]
-    return layer.reshape(2, num_pages * page_size, -1)[:, slot_mapping, ...]
+        num_pages, page_size = int(layer.shape[0]), int(layer.shape[1])
+        view = layer.reshape(num_pages * page_size, -1)
+        slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+        take = min(int(slots.numel()), int(view.shape[0]))
+        if take <= 0:
+            return view[:0, ...]
+        slots = slots[:take].clamp(0, view.shape[0] - 1)
+        return view[slots, ...]
+    num_pages, page_size = int(layer.shape[1]), int(layer.shape[2])
+    view = layer.reshape(2, num_pages * page_size, -1)
+    slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+    take = min(int(slots.numel()), int(view.shape[1]))
+    if take <= 0:
+        return view[:, :0, ...]
+    slots = slots[:take].clamp(0, view.shape[1] - 1)
+    return view[:, slots, ...]
 
 
 def _align_to_block_size(num_tokens: int, block_size: int) -> int:

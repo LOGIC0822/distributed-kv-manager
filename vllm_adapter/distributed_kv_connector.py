@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import TYPE_CHECKING, Union
 import torch
 from vllm.config import VllmConfig
@@ -6,7 +7,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.logger import init_logger
 
 # 默认的预填/分块参数，可由配置覆盖
-STORE_AFTER_PREFILL = True   # 预填充完成后一次性落全量
+STORE_AFTER_PREFILL = False
 ALLOW_PARTIAL_PREFILL_STORE = False  # 预填未完成时是否允许落部分
 DEBUG_BLOCK_ACCOUNTING = True
 BLOCK_SIZE = 16
@@ -53,16 +54,30 @@ class DistributedKVConnector(KVConnectorBase):
         self.vllm_config = config
         kv_cfg = getattr(config, "kv_transfer_config", None)
         cache_cfg = getattr(config, "cache_config", None)
-        # 运行时开关：可由配置覆盖默认值
-        self._store_after_prefill = getattr(kv_cfg, "store_after_prefill",
-                                            STORE_AFTER_PREFILL)
-        # 调试：强制使用按块增量存储，便于观察块级落盘与槽位长度
-        self._store_after_prefill = False
-        self._allow_partial_prefill_store = getattr(
-            kv_cfg, "allow_partial_prefill_store", ALLOW_PARTIAL_PREFILL_STORE)
+        extra = getattr(kv_cfg, "kv_connector_extra_config", {}) if kv_cfg is not None else {}
+        # 运行时开关：优先从 extra_config 获取
+        try:
+            self._store_after_prefill = bool(
+                extra["store_after_prefill"] if isinstance(extra, dict) and ("store_after_prefill" in extra)
+                else STORE_AFTER_PREFILL
+            )
+        except Exception:
+            self._store_after_prefill = STORE_AFTER_PREFILL
+        self._allow_partial_prefill_store = (
+            (extra.get("allow_partial_prefill_store")
+             if isinstance(extra, dict) and ("allow_partial_prefill_store" in extra)
+             else getattr(kv_cfg, "allow_partial_prefill_store", ALLOW_PARTIAL_PREFILL_STORE))
+        )
+        self._debug_block_accounting = (
+            (extra.get("debug_block_accounting")
+             if isinstance(extra, dict) and ("debug_block_accounting" in extra)
+             else getattr(kv_cfg, "debug_block_accounting", DEBUG_BLOCK_ACCOUNTING))
+        )
         self._block_size = getattr(cache_cfg, "block_size", BLOCK_SIZE)
-        self._debug_block_accounting = getattr(
-            kv_cfg, "debug_block_accounting", DEBUG_BLOCK_ACCOUNTING)
+        self._use_flexkv_slot_mapping = bool(
+            extra.get("use_flexkv_slot_mapping") if isinstance(extra, dict) and ("use_flexkv_slot_mapping" in extra)
+            else getattr(kv_cfg, "use_flexkv_slot_mapping", False)
+        )
         # 直接写文件留痕，确保初始化阶段一定能看到日志
         try:
             with open("/tmp/connector_debug.log", "a", encoding="utf-8") as f:
@@ -87,6 +102,10 @@ class DistributedKVConnector(KVConnectorBase):
         self.store_kv = store_kv
         self.should_store = should_store
         self._destroy_engine = destroy_engine
+        # 记录 (session, layer, seq_idx) -> base_stable_key，仅首块计算哈希，后续块直接复用
+        self._active_seq_keys: dict[tuple[str, int, int], str] = {}
+        # 记录 (session, layer) -> base_stable_key，用于相同会话层的多次请求复用同一稳定键
+        self._stable_key_cache: dict[tuple[str, int], str] = {}
         self.store_status = StoreStatus
         self.retrieve_status = RetrieveStatus
         self.engine_name = getattr(config, "engine_id", "unknown_engine")
@@ -104,8 +123,107 @@ class DistributedKVConnector(KVConnectorBase):
             with open("/tmp/connector_debug.log", "a", encoding="utf-8") as f:
                 f.write(msg + "\n")
                 f.flush()
-        except Exception:
+        except Exception as e:
+            try:
+                self._dbg(f"[connector] recv prep failed: {e}")
+            except Exception:
+                pass
             pass
+
+    def _get_stable_key(self, model_input: "ModelInputForGPUWithSamplingMetadata") -> str:
+        """
+        生成或获取请求的稳定键（base_key）。
+        优先使用 request_ids (attn_metadata) 作为唯一标识。
+        若无 request_ids，则回退到 (session, layer) + 首个 chunk 哈希的缓存机制。
+        """
+        # 1. 优先尝试复用已有的 _dkv_base_key
+        if hasattr(model_input, "_dkv_base_key") and model_input._dkv_base_key:
+            return model_input._dkv_base_key
+
+        # 准备 session/layer
+        session_id = getattr(model_input, "session_id", None) or b"session_0000"
+        layer_id = getattr(model_input, "layer_id", None) or 0
+        session_norm = session_id.hex() if isinstance(session_id, (bytes, bytearray)) else str(session_id)
+        layer_norm = int(layer_id)
+
+        # 2. 尝试从 attn_metadata 获取 request_ids / seq_ids
+        sa = getattr(model_input, "attn_metadata", None)
+        req_ids = getattr(sa, "request_ids", None)
+        seq_ids = getattr(sa, "seq_ids", None)
+        
+        req_id_str = None
+        if req_ids is not None:
+            # Handle list/tuple
+            if isinstance(req_ids, (list, tuple)) and len(req_ids) > 0:
+                req_id_str = str(req_ids[0])
+            # Handle tensor
+            elif hasattr(req_ids, "flatten"):
+                try:
+                    if req_ids.numel() > 0:
+                        req_id_str = str(req_ids.flatten()[0].item())
+                except:
+                    pass
+            # Handle single value
+            elif isinstance(req_ids, (str, int)):
+                req_id_str = str(req_ids)
+
+        if req_id_str:
+            # 清理特殊字符
+            req_id_str = req_id_str.replace("/", "_").replace("\\", "_")
+            # 格式: kv_{session}_layer_{layer}_req_{req_id}
+            base_key = f"kv_{session_norm}_layer_{layer_norm}_req_{req_id_str}"
+            # 保存到 model_input 以便后续使用
+            try:
+                model_input._dkv_base_key = base_key
+            except:
+                pass
+            return base_key
+
+        # 其次使用 seq_id (vLLM 中通常是唯一的，且必传)
+        seq_id_str = None
+        if seq_ids is not None:
+             if isinstance(seq_ids, (list, tuple)) and len(seq_ids) > 0:
+                 seq_id_str = str(seq_ids[0])
+             elif hasattr(seq_ids, "flatten"):
+                 try:
+                     if seq_ids.numel() > 0:
+                         seq_id_str = str(seq_ids.flatten()[0].item())
+                 except:
+                     pass
+             elif isinstance(seq_ids, (int, str)):
+                 seq_id_str = str(seq_ids)
+        
+        if seq_id_str:
+            base_key = f"kv_{session_norm}_layer_{layer_norm}_seq_{seq_id_str}"
+            try:
+                model_input._dkv_base_key = base_key
+            except:
+                pass
+            return base_key
+
+        # 3. 回退逻辑：使用 (session, layer) 缓存的首个 chunk 哈希
+        cache_k = (session_norm, layer_norm)
+        if cache_k in self._stable_key_cache:
+            base_key = self._stable_key_cache[cache_k]
+            try:
+                model_input._dkv_base_key = base_key
+            except:
+                pass
+            return base_key
+
+        # 4. 计算哈希 (First chunk case)
+        try:
+            full_hash = self.engine._tensor_hash(model_input.input_tokens)
+        except Exception:
+            full_hash = "nohash"
+            
+        base_key = f"kv_{session_norm}_layer_{layer_norm}_{full_hash}"
+        self._stable_key_cache[cache_k] = base_key
+        try:
+            model_input._dkv_base_key = base_key
+        except:
+            pass
+        return base_key
 
     def recv_kv_caches_and_hidden_states(
         self,
@@ -114,44 +232,41 @@ class DistributedKVConnector(KVConnectorBase):
         kv_caches: list[torch.Tensor]
     ) -> tuple[Union[torch.Tensor, IntermediateTensors], bool, "ModelInputForGPUWithSamplingMetadata"]:
         # 默认填充会话/层与稳定键，避免 None 导致键不一致
+        stable_key_arg = None
         try:
-            if getattr(model_input, "session_id", None) is None:
-                model_input.session_id = b"session_0000"
-            if getattr(model_input, "layer_id", None) is None:
-                model_input.layer_id = 0
-            # 基于完整输入 token 计算哈希，生成稳定键（避免元数据截断且全块共用同一键）
+            # 使用统一逻辑获取 stable_key
+            base_key = self._get_stable_key(model_input)
+            stable_key_arg = f"{base_key}.pt"
+            
+            # 尝试写入 model_input，失败则忽略
+            pass
+            
+            self._dbg(f"[connector] recv prep stable_key={stable_key_arg} base={base_key}")
+        except Exception as e:
             try:
-                full_hash = self.engine._tensor_hash(model_input.input_tokens)
-            except Exception:
-                full_hash = "nohash"
-            session_norm = model_input.session_id.decode("utf-8", errors="ignore") if isinstance(model_input.session_id, (bytes, bytearray)) else str(model_input.session_id)
-            layer_norm = model_input.layer_id if model_input.layer_id is not None else 0
-            base_key = f"kv_{session_norm}_layer_{layer_norm}_{full_hash}"
-            model_input.stable_key = f"{base_key}.pt"
-            # 记住基键，后续块文件统一使用哈希前缀，避免 seq0 固定命名覆盖
-            try:
-                model_input._dkv_base_key = base_key
+                self._dbg(f"[connector] recv prep failed: {e}")
             except Exception:
                 pass
-        except Exception:
-            pass
+        
         try:
-            self._dbg(f"[connector] recv enter session_id={getattr(model_input,'session_id',None)} layer_id={getattr(model_input,'layer_id',None)} stable_key={getattr(model_input,'stable_key',None)} seq_lens={getattr(getattr(model_input,'attn_metadata',None),'seq_lens',None)}")
+            self._dbg(f"[connector] recv enter session_id={getattr(model_input,'session_id',None)} layer_id={getattr(model_input,'layer_id',None)} stable_key={stable_key_arg}")
         except Exception:
             pass
 
-        retrieve_status = self.engine.should_retrieve(model_input)
+        # 保持 vLLM 上游的 slot_mapping，不做改写，避免影响 KV 槽位一致性
+
+        retrieve_status = self.engine.should_retrieve(model_input, stable_key=stable_key_arg)
         hidden_or_intermediate_states, bypass_model_exec, model_input  = self.engine.retrieve_kv(
-            model_executable, model_input, kv_caches, retrieve_status
+            model_executable, model_input, kv_caches, retrieve_status, stable_key=stable_key_arg
         )
         return hidden_or_intermediate_states, bypass_model_exec, model_input
 
     def send_kv_caches_and_hidden_states(
         self,
-        model_executable: torch.nn.Module,
+        model_executable,
         model_input: "ModelInputForGPUWithSamplingMetadata",
-        kv_caches: list[torch.Tensor],
-        hidden_or_intermediate_states: Union[torch.Tensor, IntermediateTensors],
+        kv_caches,
+        hidden_or_intermediate_states,
     ) -> None:
         block_size = int(self._block_size) if hasattr(self, "_block_size") else BLOCK_SIZE
         # 入口埋点，确认是否进入 send
@@ -160,29 +275,26 @@ class DistributedKVConnector(KVConnectorBase):
             logger.info("[connector] send_enter")
         except Exception:
             pass
+        # 调试：打印 vLLM 传入的元数据是否包含 seq_ids/request_ids
+        try:
+            sa = getattr(model_input, "attn_metadata", None)
+            seq_ids = getattr(sa, "seq_ids", None)
+            req_ids = getattr(sa, "request_ids", None)
+            self._dbg(f"[connector] send meta seq_ids={seq_ids} request_ids={req_ids}")
+        except Exception:
+            pass
 
         # 发送前补充默认的 session/layer/stable_key（与 recv 同步），确保存取使用同一哈希键
+        stable_key_arg = None
         try:
-            if getattr(model_input, "session_id", None) is None:
-                model_input.session_id = b"session_0000"
-            if getattr(model_input, "layer_id", None) is None:
-                model_input.layer_id = 0
-            try:
-                full_hash = self.engine._tensor_hash(model_input.input_tokens)
-            except Exception:
-                full_hash = "nohash"
-            session_norm = model_input.session_id.decode("utf-8", errors="ignore") if isinstance(model_input.session_id, (bytes, bytearray)) else str(model_input.session_id)
-            layer_norm = model_input.layer_id if model_input.layer_id is not None else 0
-            # 优先复用 recv 阶段注入的哈希基键，确保跨 chunk 共享同一 stable_key
-            base_key = getattr(model_input, "_dkv_base_key", None)
-            if not base_key:
-                base_key = f"kv_{session_norm}_layer_{layer_norm}_{full_hash}"
-                try:
-                    model_input._dkv_base_key = base_key
-                except Exception:
-                    pass
-            model_input.stable_key = f"{base_key}.pt"
-            self._dbg(f"[connector] send prep session={model_input.session_id} layer={model_input.layer_id} stable_key={model_input.stable_key}")
+            # 使用统一逻辑获取 stable_key
+            base_key = self._get_stable_key(model_input)
+            stable_key_arg = f"{base_key}.pt"
+            
+            # 尝试写入 model_input，失败则忽略
+            pass
+            
+            self._dbg(f"[connector] send prep session={getattr(model_input,'session_id',None)} layer={getattr(model_input,'layer_id',None)} stable_key={stable_key_arg}")
         except Exception:
             pass
 
@@ -238,7 +350,7 @@ class DistributedKVConnector(KVConnectorBase):
                     end_pos = start_pos + seq_len
                     try:
                         current_tokens = input_tokens[start_pos:end_pos]
-                        file_key = self.engine._make_key(current_tokens, session_id, layer_id)
+                        file_key = self.engine._make_key(current_tokens, session_id, layer_id, stable_key=stable_key_arg)
                     except Exception:
                         file_key = f"seq_{seq_idx}_len_{seq_len}"
 
@@ -269,7 +381,7 @@ class DistributedKVConnector(KVConnectorBase):
         # track whether we performed any per-block stores in this call
         self._last_performed_block_store = False
 
-        def _make_block_kv_cache(orig_kv_cache: torch.Tensor, seq_idx: int, blk_start: int, blk_end: int):
+        def _make_block_kv_cache(orig_kv_cache, seq_idx: int, blk_start: int, blk_end: int):
             if orig_kv_cache is None:
                 return None
             try:
@@ -344,7 +456,7 @@ class DistributedKVConnector(KVConnectorBase):
             small_mi.session_id = session_id
             small_mi.layer_id = layer_id
             # 显式指定稳定键，驱动引擎按块落盘
-            small_mi.stable_key = block_file_key
+            small_mi.stable_key = base_file_key
 
             # Attach minimal payload_meta for diagnostic purposes so we can
             # observe what the connector attempted to persist for this block.
@@ -357,14 +469,13 @@ class DistributedKVConnector(KVConnectorBase):
                 "block_size": int(blk_len),
                 # 存储侧的总长使用块长，避免 slot_mapping 与 seq_len 不匹配警告
                 "total_tokens": int(blk_len),
-                # 告诉引擎分块存储使用的稳定 key（包含块偏移），避免覆盖
-                "stable_key": block_file_key,
+                "stable_key": base_file_key,
                 "base_stable_key": base_file_key,
             }
 
             # compute store_status
             try:
-                store_status = self.should_store(small_mi)
+                store_status = self.engine.should_store(small_mi, stable_key=base_file_key)
             except Exception:
                 store_status = None
 
@@ -374,11 +485,11 @@ class DistributedKVConnector(KVConnectorBase):
                 # easy to trace in the server logs what offsets the
                 # connector attempted to persist.
                 try:
-                    logger.info("[connector] storing block payload_meta=%s key=%s", getattr(small_mi, "payload_meta", {}), block_file_key)
+                    logger.info("[connector] storing block payload_meta=%s key=%s", getattr(small_mi, "payload_meta", {}), base_file_key)
                 except Exception:
                     pass
 
-                self.store_kv(
+                self.engine.store_kv(
                     self.vllm_config.model_config,
                     self.vllm_config.parallel_config,
                     self.transfer_config,
@@ -387,13 +498,15 @@ class DistributedKVConnector(KVConnectorBase):
                     block_kv_caches,
                     store_status,
                     None,
+                    stable_key=base_file_key,
                 )
                 # mark that we've persisted a block in this invocation
                 try:
                     self._last_performed_block_store = True
                 except Exception:
                     pass
-                __import__("sys").stderr.write(f"[connector] stored block idx={blk_idx} range=[{blk_start},{blk_end}) len={blk_len} key={block_file_key}\n"); logger.info("[connector] stored block idx=%d range=[%d,%d) len=%d key=%s", blk_idx, blk_start, blk_end, blk_len, block_file_key)
+                __import__("sys").stderr.write(f"[connector] stored block idx={blk_idx} range=[{blk_start},{blk_end}) len={blk_len} key={base_file_key}\n")
+                logger.info("[connector] stored block idx=%d range=[%d,%d) len=%d key=%s", blk_idx, blk_start, blk_end, blk_len, base_file_key)
                 return True
             except Exception as e:
                 logger.exception("[connector] block store failed: %s", e)
@@ -415,19 +528,11 @@ class DistributedKVConnector(KVConnectorBase):
                     if isinstance(layer_id, str) and layer_id.lower() == "none":
                         layer_id = None
                     layer_norm = layer_id if layer_id is not None else 0
-                    # 优先使用 recv 阶段计算的哈希基键，确保落盘/检索稳定；若缺失则立即生成，避免回退到 seq 前缀导致覆盖
-                    base_key = getattr(model_input, "_dkv_base_key", None)
-                    if not base_key:
-                        try:
-                            full_hash = self.engine._tensor_hash(input_tokens)
-                        except Exception:
-                            full_hash = "nohash"
-                        base_key = f"kv_{session_norm}_layer_{layer_norm}_{full_hash}"
-                        try:
-                            model_input._dkv_base_key = base_key
-                        except Exception:
-                            pass
-                    engine_stable_key = f"{base_key}.pt"
+                    
+                    # 使用统一逻辑获取 stable_key (request_id 优先 -> session+layer缓存 -> 计算hash)
+                    stable_base_key = self._get_stable_key(model_input)
+                    
+                    engine_stable_key = f"{stable_base_key}.pt"
                     stable_key = engine_stable_key  # 用同一键跟踪累计长度
                     prev_len_global = int(self._prefill_prev_len.get(stable_key, 0))
 
@@ -501,7 +606,12 @@ class DistributedKVConnector(KVConnectorBase):
                     logger.info("[connector] update prev_len stable_key=%s new_prev_len=%d", stable_key, self._prefill_prev_len[stable_key])
                     self._dbg(f"[connector-print] update prev_len stable_key={stable_key} new_prev_len={self._prefill_prev_len[stable_key]}")
                 except Exception as e:
-                    logger.warning("[connector] per-seq block store failed: %s", e)
+                    logger.exception("[connector] per-seq block store failed (debug)")
+                    try:
+                        import traceback
+                        self._dbg(traceback.format_exc())
+                    except Exception:
+                        pass
             # 仅保留按块存储，跳过后续全量存储逻辑
             return
 
@@ -520,65 +630,17 @@ class DistributedKVConnector(KVConnectorBase):
             performed_block_store = False
 
         # Attach payload_meta to top-level model_input for diagnostic runs too
-        try:
-            if not hasattr(model_input, "payload_meta"):
-                model_input.payload_meta = {}
-            model_input.payload_meta.update({"connector_prev_len_map": self._prefill_prev_len})
-        except Exception:
-            pass
+        pass
 
         # 仅在启用 store_after_prefill 且按块未执行时执行一次性全量落盘。
         if self._store_after_prefill and not performed_block_store:
-            # 再次稳妥校验：所有序列在本次 forward 结束时是否已完全可见
             try:
-                # 等待 CUDA 异步内核完成，避免读取到未写完的可见长度
-                try:
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                except Exception:
-                    pass
-                first_k = kv_caches[0][0]
-                seq_lens = list(model_input.attn_metadata.seq_lens)
-                all_final_ready = True
-                for seq_idx, seq_len in enumerate(seq_lens):
-                    seq_len = int(seq_len)
-                    if first_k.dim() == 4:
-                        # 4D 视图下 shape 的 seq 维通常是容量而非可见长度，改用 slot_mapping 切片长度进行判定
-                        try:
-                            sm = getattr(model_input.attn_metadata, "slot_mapping", None)
-                            if sm is not None and sm.dim() >= 1:
-                                start_pos = int(sum(int(x) for x in seq_lens[:seq_idx]))
-                                end_pos = start_pos + seq_len
-                                if sm.dim() == 1:
-                                    avail_final = int((sm[start_pos:end_pos]).shape[0])
-                                else:
-                                    avail_final = int((sm[seq_idx][:seq_len]).shape[0])
-                            else:
-                                # 回退：以期望长度作为可见长度（交由引擎内部按最小可取长度裁剪）
-                                avail_final = seq_len
-                        except Exception:
-                            avail_final = seq_len
-                    else:
-                        # 3D 视图回退：交由引擎以最小长度处理
-                        avail_final = seq_len
-                    if avail_final < seq_len:
-                        all_final_ready = False
-                        break
-
-                # 调试：对比初始与最终可见判定
-                try:
-                    init_flag = getattr(model_input, "_prefill_initial_ready", None)
-                    logger.info("[connector] store_after_prefill: initial_ready=%s, final_ready=%s", init_flag, all_final_ready)
-                except Exception:
-                    pass
-
-                if not all_final_ready:
-                    return
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
             except Exception:
-                # 如果复查失败，则保守起见不做一次性落盘
-                return
-
-            store_status = self.engine.should_store(model_input)
+                pass
+            pass
+            store_status = self.engine.should_store(model_input, stable_key=stable_key_arg)
             self.engine.store_kv(
                 self.vllm_config.model_config,
                 self.vllm_config.parallel_config,
@@ -588,9 +650,9 @@ class DistributedKVConnector(KVConnectorBase):
                 kv_caches,
                 store_status,
                 hidden_or_intermediate_states,
+                stable_key=stable_key_arg,
             )
         else:
-            # 已按块落盘或未启用一次性全量落盘，避免再写全量文件
             return
 
     def close(self):

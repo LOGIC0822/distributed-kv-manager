@@ -27,6 +27,12 @@ class V1Storage:
     def exists(self, file_path: str) -> bool:
         return self._backend.exists(file_path)
 
+    def delete(self, file_path: str) -> bool:
+        del_fn = getattr(self._backend, "delete", None)
+        if callable(del_fn):
+            return bool(del_fn(file_path))
+        return False
+
     # ----- Full-payload helpers (v0 layout; v1 engine 不直接使用) -----
     def pack_full_payload(
         self,

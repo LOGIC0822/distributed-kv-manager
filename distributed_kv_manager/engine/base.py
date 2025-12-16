@@ -10,18 +10,18 @@ class RetrieveStatus(Enum):
 
 class DistributedKVEngineBase:
     """KV缓存存储后端抽象"""
-    def should_store(self, model_input) -> StoreStatus:
+    def should_store(self, model_input, **kwargs) -> StoreStatus:
         raise NotImplementedError
 
     def store_kv(self, model_config, parallel_config, transfer_config,
                  model_executable, model_input, kv_caches, store_status,
-                 hidden_or_intermediate_states=None):
+                 hidden_or_intermediate_states=None, **kwargs):
         raise NotImplementedError
 
-    def should_retrieve(self, model_input) -> RetrieveStatus:
+    def should_retrieve(self, model_input, **kwargs) -> RetrieveStatus:
         raise NotImplementedError
 
-    def retrieve_kv(self, model_executable, model_input, kv_caches, retrieve_status):
+    def retrieve_kv(self, model_executable, model_input, kv_caches, retrieve_status, **kwargs):
         raise NotImplementedError
 
     def close(self):

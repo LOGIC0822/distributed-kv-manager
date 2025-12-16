@@ -7,8 +7,12 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import etcd3
-from etcd3 import Etcd3Client
+try:
+    import etcd3  # type: ignore
+    from etcd3 import Etcd3Client  # type: ignore
+except Exception:
+    etcd3 = None  # type: ignore[assignment]
+    Etcd3Client = object  # type: ignore[misc,assignment]
 try:
     from distributed_kv_manager.metadata.mock_etcd import MockEtcd3Client
 except Exception:
@@ -167,10 +171,17 @@ class EtcdConnectionPool:
 
     def _init_connections(self) -> None:
         """初始化所有 etcd 连接。"""
+        if etcd3 is None:
+            if MockEtcd3Client is not None:
+                mock_client = MockEtcd3Client()
+                self.clients["mock"] = mock_client
+                print("[EtcdConnectionPool] Using MockEtcd3Client fallback (no etcd3)")
+                return
+            raise RuntimeError("etcd3 module not available and no mock client!")
         for ep in self.endpoints:
             try:
                 host, port = ep.split(":")
-                client = etcd3.client(host=host, port=int(port))
+                client = etcd3.client(host=host, port=int(port))  # type: ignore[attr-defined]
                 client.status()
                 self.clients[ep] = client
                 print(f"[EtcdConnectionPool] Connected to etcd {ep}")
@@ -231,11 +242,16 @@ class EtcdConnectionPool:
         for endpoint in self.clients:
             if not self._check_connection(self.clients[endpoint]):
                 try:
-                    host, port = endpoint.split(":")
-                    client = etcd3.client(host=host, port=int(port))
-                    client.status()
-                    self.clients[endpoint] = client
-                    print(f"[EtcdConnectionPool] Reconnected to etcd {endpoint}")
+                    if etcd3 is None:
+                        # 保守处理：若无 etcd3，使用 mock
+                        self.clients[endpoint] = MockEtcd3Client() if MockEtcd3Client is not None else None
+                        print(f"[EtcdConnectionPool] Reconnected (mock) to {endpoint}")
+                    else:
+                        host, port = endpoint.split(":")
+                        client = etcd3.client(host=host, port=int(port))  # type: ignore[attr-defined]
+                        client.status()
+                        self.clients[endpoint] = client
+                        print(f"[EtcdConnectionPool] Reconnected to etcd {endpoint}")
                 except Exception as e:
                     print(f"[EtcdConnectionPool] Failed to reconnect {endpoint}: {e}")
                     self.clients[endpoint] = None
