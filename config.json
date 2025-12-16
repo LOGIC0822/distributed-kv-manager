@@ -18,7 +18,10 @@
     "store_after_prefill": true,
     "remote_dir": "/kvcache_v1/remote",
     "remote_backend_type": "local",
-    "layer_split_front": -1
+    "layer_split_front": -1,
+    "extra_config": {
+      "min_store_tokens": 1
+    }
   },
   "rank": 0,
   "local_rank": 0
