@@ -203,7 +203,6 @@ class KVEngine(DistributedKVEngineBase):
 
     # ------------------ KV 存储/检索 ------------------ #
     def should_store(self, model_input, **kwargs) -> StoreStatus:
-        # 简单策略：总是存
         return StoreStatus.STORED
 
     def should_retrieve(self, model_input, **kwargs) -> RetrieveStatus:
@@ -220,18 +219,14 @@ class KVEngine(DistributedKVEngineBase):
             start_pos = sum(seq_lens[:seq_idx])
             end_pos = start_pos + seq_len
             current_tokens = input_tokens[start_pos:end_pos]
-            # 获取session_id和layer_id
             session_id = getattr(model_input, "session_id", None)
             layer_id = getattr(model_input, "layer_id", None)
-            # 分块场景下，为同一序列使用稳定键，避免因切片不同导致 key 不一致
             stable_key_override = stable_key_arg
             session_str = session_id.hex() if isinstance(session_id, (bytes, bytearray)) else str(session_id or "session_0000")
             default_stable_key = f"kv_{session_str}_layer_{layer_id or 0}_seq{seq_idx}.pt"
             stable_key = stable_key_override or default_stable_key
             file_path = self._make_key(current_tokens, session_id, layer_id, stable_key=stable_key)
-            self._dbg(f"[store] seq_idx={seq_idx} session={session_str} layer={layer_id} stable_key_override={stable_key_override} file_path={file_path} len={seq_len}")
 
-            # 从 MetadataCache 访问元数据
             meta = self._meta_cache.get_metadata(
                 key=file_path,
                 layer_id=layer_id,
@@ -239,9 +234,7 @@ class KVEngine(DistributedKVEngineBase):
             )
 
             if meta is None or meta.status != 1:
-                # 元数据不存在或者状态不是已提交，则 MISS
                 return RetrieveStatus.MISS
-            # 额外校验：小于最小存储阈值的条目不参与命中
             try:
                 kv_bytes_exist = self._storage_download_kv_bytes(file_path)
                 if kv_bytes_exist is None:
@@ -251,17 +244,18 @@ class KVEngine(DistributedKVEngineBase):
                 exist_slots_len = int(pm_exist.get("slots_len", 0) or 0)
                 if exist_slots_len < int(getattr(self, "_min_store_tokens", 16)):
                     return RetrieveStatus.MISS
+                try:
+                    expected_hash = self._tensor_hash(current_tokens[:exist_slots_len] if exist_slots_len > 0 else current_tokens)
+                    stored_hash = str(pm_exist.get("tokens_hash", "")) if isinstance(pm_exist, dict) else ""
+                    if not stored_hash or stored_hash != expected_hash:
+                        return RetrieveStatus.MISS
+                except Exception:
+                    return RetrieveStatus.MISS
             except Exception:
                 return RetrieveStatus.MISS
-                
-            # 检查元数据是否已过期
             if meta.is_expired():
-                # 元数据已过期，则 MISS
-                logger.debug(f"元数据已过期: {file_path}")
                 return RetrieveStatus.MISS
 
-        # 所有序列都存在且已提交
-        logger.debug(f"KV Cache 命中")
         return RetrieveStatus.HIT
 
     def store_kv(
@@ -301,7 +295,11 @@ class KVEngine(DistributedKVEngineBase):
             # 分块场景下，为同一序列使用稳定键，避免因切片不同导致 key 不一致
             stable_key_override = stable_key_arg or getattr(model_input, "stable_key", None)
             session_str = session_id.hex() if isinstance(session_id, (bytes, bytearray)) else str(session_id or "session_0000")
-            stable_key = stable_key_override or f"kv_{session_str}_layer_{layer_id or 0}_seq{seq_idx}.pt"
+            try:
+                seq_hash = self._tensor_hash(current_tokens)
+            except Exception:
+                seq_hash = "empty"
+            stable_key = stable_key_override or f"kv_{session_str}_layer_{layer_id or 0}_seq{seq_idx}_{seq_hash}.pt"
             stable_key_prefix = (stable_key[:-3] if isinstance(stable_key, str) and stable_key.endswith(".pt") else stable_key)
             file_path = self._make_key(current_tokens, session_id, layer_id, stable_key=stable_key)
 
@@ -654,7 +652,11 @@ class KVEngine(DistributedKVEngineBase):
             layer_eff = layer_id if layer_id is not None else 0
             session_str = (session_eff.hex() if isinstance(session_eff, (bytes, bytearray)) else str(session_eff or "session_0000"))
             # 与 store_kv 对齐：若未显式传入稳定键，则使用基于序号的稳定键
-            stable_key = stable_key_override or f"kv_{session_str}_layer_{layer_eff}_seq{seq_idx}.pt"
+            try:
+                seq_hash = self._tensor_hash(current_tokens)
+            except Exception:
+                seq_hash = "empty"
+            stable_key = stable_key_override or f"kv_{session_str}_layer_{layer_eff}_seq{seq_idx}_{seq_hash}.pt"
             file_path = self._make_key(current_tokens, session_eff, layer_eff, stable_key=stable_key)
             self._dbg(
                 f"[retrieve] seq_idx={seq_idx} key={file_path} seq_len={seq_len} "
@@ -762,6 +764,23 @@ class KVEngine(DistributedKVEngineBase):
                                 return
                         info = self._storage.extract_payload_info(kvb)
                         pm = info.get("payload_meta", {}) if isinstance(info, dict) else {}
+                        try:
+                            nonlocal tokens_hash, expected_layers, payload_meta, payload_info
+                            if rel_path == stable_key:
+                                try:
+                                    t_h = pm.get("tokens_hash", None)
+                                    tokens_hash = str(t_h) if t_h is not None else None
+                                except Exception:
+                                    tokens_hash = tokens_hash
+                                try:
+                                    n_l = pm.get("num_layers", None)
+                                    expected_layers = int(n_l) if n_l is not None else None
+                                except Exception:
+                                    expected_layers = expected_layers
+                                payload_meta = pm if isinstance(pm, dict) else {}
+                                payload_info = info if isinstance(info, dict) else {}
+                        except Exception:
+                            pass
                         # prefer connector-provided token_offset (absolute) and normalize
                         # to the current sequence-relative offset
                         if isinstance(pm, dict) and "token_offset" in pm:
@@ -1213,6 +1232,10 @@ class KVEngine(DistributedKVEngineBase):
         """
         # 优先使用外部提供的稳定键
         if stable_key:
+            try:
+                logger.info(f"[naming] use_stable_key={stable_key}")
+            except Exception:
+                pass
             return stable_key
 
         seq_hash = self._tensor_hash(input_tokens)
@@ -1224,7 +1247,12 @@ class KVEngine(DistributedKVEngineBase):
         # 将session_id转换为字符串
         session_str = session_id.hex() if isinstance(session_id, (bytes, bytearray)) else str(session_id)
         # 构造文件名，不包含路径前缀
-        return f"kv_{session_str}_layer_{layer_id}_{seq_hash}.pt"
+        key = f"kv_{session_str}_layer_{layer_id}_{seq_hash}.pt"
+        try:
+            logger.info(f"[naming] gen_key session={session_str} layer={layer_id} hash={seq_hash} key={key}")
+        except Exception:
+            pass
+        return key
 
     # ------------------ Helper: 解析序列槽位映射 ------------------ #
     def _resolve_sequence_slots(

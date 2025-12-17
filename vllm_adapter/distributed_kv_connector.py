@@ -199,17 +199,13 @@ class DistributedKVConnector(KVConnectorBase):
                 model_input._dkv_base_key = base_key
             except:
                 pass
-            return base_key
-
-        # 3. 回退逻辑：使用 (session, layer) 缓存的首个 chunk 哈希
-        cache_k = (session_norm, layer_norm)
-        if cache_k in self._stable_key_cache:
-            base_key = self._stable_key_cache[cache_k]
             try:
-                model_input._dkv_base_key = base_key
-            except:
+                self._dbg(f"[connector] base_key.seq_id={base_key}")
+            except Exception:
                 pass
             return base_key
+
+        # 3. 回退逻辑：直接基于当前 input_tokens 计算哈希，避免跨请求复用导致命名冲突
 
         # 4. 计算哈希 (First chunk case)
         try:
@@ -218,10 +214,13 @@ class DistributedKVConnector(KVConnectorBase):
             full_hash = "nohash"
             
         base_key = f"kv_{session_norm}_layer_{layer_norm}_{full_hash}"
-        self._stable_key_cache[cache_k] = base_key
         try:
             model_input._dkv_base_key = base_key
         except:
+            pass
+        try:
+            self._dbg(f"[connector] base_key.hash={base_key}")
+        except Exception:
             pass
         return base_key
 
