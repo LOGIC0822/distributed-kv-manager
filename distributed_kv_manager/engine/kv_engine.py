@@ -335,13 +335,17 @@ class KVEngine(DistributedKVEngineBase):
             for layer_idx in range(num_layers):
                 kv_cache = kv_caches[layer_idx]
                 key_cache, value_cache = self.split_kv_cache(kv_cache)
-                if key_cache.dim() == 4:
+                dims = key_cache.dim()
+                if dims == 4:
                     if seq_idx >= key_cache.shape[0]:
                         logger.error("seq_idx=%d 超过 batch 维度大小=%d", seq_idx, key_cache.shape[0])
                         candidate = 0
                     else:
                         candidate = min(seq_len, int(key_cache[seq_idx].shape[0]))
-                elif key_cache.dim() == 3:
+                elif dims == 3:
+                    total_tokens = int(key_cache.shape[0])
+                    candidate = min(seq_len, max(0, total_tokens - int(start_pos)))
+                elif dims == 2:
                     total_tokens = int(key_cache.shape[0])
                     candidate = min(seq_len, max(0, total_tokens - int(start_pos)))
                 else:
@@ -382,23 +386,23 @@ class KVEngine(DistributedKVEngineBase):
 
             # 第二遍：按统一长度收集各层 KV
             all_keys, all_values = [], []
+            expected_tail_shape = None
             for layer_idx in range(num_layers):
                 kv_cache = kv_caches[layer_idx]
                 key_cache, value_cache = self.split_kv_cache(kv_cache)
-                if key_cache.dim() < 3:
-                    continue
-                num_heads = int(key_cache.shape[-2])
-                head_dim = int(key_cache.shape[-1])
                 import torch as _torch
                 gseq = _torch.arange(int(persist_len), dtype=_torch.long, device=current_tokens.device)
-                if key_cache.dim() == 4:
+                dims = int(key_cache.dim())
+                selected_k = None
+                selected_v = None
+                if dims == 4:
                     try:
                         selected_k = key_cache[seq_idx][gseq]
                         selected_v = value_cache[seq_idx][gseq]
                     except Exception as e:
                         logger.error("store gather dim4 failed: %s", e, exc_info=True)
                         continue
-                else:
+                elif dims == 3:
                     global_idx = gseq + int(start_pos) + int(persist_start)
                     try:
                         selected_k = key_cache[global_idx]
@@ -406,8 +410,36 @@ class KVEngine(DistributedKVEngineBase):
                     except Exception as e:
                         logger.error("store gather dim3 failed: %s", e, exc_info=True)
                         continue
-                all_keys.append(selected_k.unsqueeze(0))
-                all_values.append(selected_v.unsqueeze(0))
+                elif dims == 2:
+                    global_idx = gseq + int(start_pos) + int(persist_start)
+                    try:
+                        selected_k = key_cache[global_idx].unsqueeze(1)
+                        selected_v = value_cache[global_idx].unsqueeze(1)
+                    except Exception as e:
+                        logger.error("store gather dim2 failed: %s", e, exc_info=True)
+                        continue
+                else:
+                    logger.error("无法识别的KV缓存形状(存储): %s", key_cache.shape)
+                    continue
+
+                if selected_k is None or selected_v is None:
+                    continue
+
+                packed_k = selected_k.unsqueeze(0)
+                packed_v = selected_v.unsqueeze(0)
+                if expected_tail_shape is None:
+                    expected_tail_shape = packed_k.shape[1:]
+                elif packed_k.shape[1:] != expected_tail_shape or packed_v.shape[1:] != expected_tail_shape:
+                    logger.error(
+                        "KV形状不一致，跳过层 %d: 当前=%s 期望=%s",
+                        layer_idx,
+                        packed_k.shape,
+                        expected_tail_shape,
+                    )
+                    continue
+
+                all_keys.append(packed_k)
+                all_values.append(packed_v)
 
             all_keys = torch.cat(all_keys, dim=0) if all_keys else torch.tensor([])
             all_values = torch.cat(all_values, dim=0) if all_values else torch.tensor([])
@@ -995,11 +1027,13 @@ class KVEngine(DistributedKVEngineBase):
                         kv_cache = kv_caches[layer_idx]
                         key_cache, value_cache = self.split_kv_cache(kv_cache)
 
-                        if key_cache.dim() < 3:
+                        dims = int(key_cache.dim())
+                        if dims < 2:
                             logger.error("无法识别的KV缓存形状(写回): %s", key_cache.shape)
                             raise ValueError("Unsupported KV cache layout")
-                        num_heads = int(key_cache.shape[-2])
-                        head_dim = int(key_cache.shape[-1])
+                        if dims >= 3:
+                            num_heads = int(key_cache.shape[-2])
+                            head_dim = int(key_cache.shape[-1])
                         try:
                             import torch as _torch
                             if block_slots is not None:
@@ -1013,10 +1047,8 @@ class KVEngine(DistributedKVEngineBase):
                         limit = min(int(layer_k.shape[0]), int(slice_slots.numel()))
                         if limit <= 0:
                             continue
-                        if int(layer_k.shape[-2]) != num_heads or int(layer_k.shape[-1]) != head_dim:
-                            continue
                         import torch as _torch
-                        if key_cache.dim() == 4:
+                        if dims == 4:
                             max_win = int(key_cache[seq_idx].shape[0])
                             eff = min(limit, max_win)
                             if eff <= 0:
@@ -1025,7 +1057,9 @@ class KVEngine(DistributedKVEngineBase):
                             key_cache[seq_idx][dest] = layer_k[:eff].to(key_cache.dtype)
                             value_cache[seq_idx][dest] = layer_v[:eff].to(value_cache.dtype)
                             restored_tokens_for_seq += int(eff)
-                        else:
+                        elif dims == 3:
+                            if int(layer_k.shape[-2]) != num_heads or int(layer_k.shape[-1]) != head_dim:
+                                continue
                             max_win = int(key_cache.shape[0]) - int(start_pos)
                             eff = min(limit, max_win)
                             if eff <= 0:
@@ -1033,6 +1067,23 @@ class KVEngine(DistributedKVEngineBase):
                             dest = _torch.arange(eff, dtype=_torch.long, device=input_tokens.device) + int(start_pos)
                             key_cache[dest] = layer_k[:eff].to(key_cache.dtype)
                             value_cache[dest] = layer_v[:eff].to(value_cache.dtype)
+                            restored_tokens_for_seq += int(eff)
+                        elif dims == 2:
+                            hidden = int(key_cache.shape[1])
+                            try:
+                                lk_flat = layer_k.reshape(layer_k.shape[0], -1)
+                                lv_flat = layer_v.reshape(layer_v.shape[0], -1)
+                            except Exception:
+                                continue
+                            if int(lk_flat.shape[1]) != hidden or int(lv_flat.shape[1]) != hidden:
+                                continue
+                            max_win = int(key_cache.shape[0]) - int(start_pos)
+                            eff = min(limit, max_win)
+                            if eff <= 0:
+                                continue
+                            dest = _torch.arange(eff, dtype=_torch.long, device=input_tokens.device) + int(start_pos)
+                            key_cache[dest] = lk_flat[:eff].to(key_cache.dtype)
+                            value_cache[dest] = lv_flat[:eff].to(value_cache.dtype)
                             restored_tokens_for_seq += int(eff)
 
                     # restored_tokens_for_seq updated per layer writes above
