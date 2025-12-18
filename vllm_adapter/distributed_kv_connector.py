@@ -323,6 +323,9 @@ class DistributedKVConnector(KVConnectorBase):
                     elif k0.dim() == 3:
                         total_tokens = int(k0.shape[0])
                         avail = min(max(0, total_tokens - start_pos), int(seq_len))
+                    elif k0.dim() == 2:
+                        total_tokens = int(k0.shape[0])
+                        avail = min(max(0, total_tokens - start_pos), int(seq_len))
                 except Exception:
                     pass
             # 保底：若无法估计可见长度，退回整个 seq_len，避免 new_sealed 恒为 0
@@ -394,6 +397,10 @@ class DistributedKVConnector(KVConnectorBase):
                     # [total_tokens, num_heads, head_dim]
                     key_block = key_cache[blk_start:blk_end].contiguous()
                     value_block = value_cache[blk_start:blk_end].contiguous()
+                elif key_cache.dim() == 2:
+                    # [total_tokens, hidden] -> expand head dim=1
+                    key_block = key_cache[blk_start:blk_end].unsqueeze(1).contiguous()
+                    value_block = value_cache[blk_start:blk_end].unsqueeze(1).contiguous()
                 else:
                     logger.warning("[connector] unsupported kv cache dim=%d", key_cache.dim())
                     return None

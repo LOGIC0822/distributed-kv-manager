@@ -572,6 +572,17 @@ class KVEngine(DistributedKVEngineBase):
                             k_old, v_old = None, None
                         if k_old is not None and v_old is not None:
                             import torch as _torch
+                            # 若旧缓存的尾部维度与当前不一致（例如从多头flatten到单头扁平），放弃合并，直接用当前视图写入
+                            try:
+                                tail_new = tuple(self.all_keys.shape[2:]) if self.all_keys.dim() >= 3 else None
+                                tail_old = tuple(k_old.shape[2:]) if k_old.dim() >= 3 else None
+                                if tail_new != tail_old:
+                                    # TODO: 将不同后端/kv维度分开落盘，避免切换后需要清空缓存
+                                    self.engine._dbg(f"[store] skip merge due to tail_mismatch old={tail_old} new={tail_new} key={self.file_path}")
+                                    k_old, v_old = None, None
+                            except Exception:
+                                k_old, v_old = None, None
+                        if k_old is not None and v_old is not None:
                             old_len = int(k_old.shape[1]) if k_old.dim() >= 2 else 0
                             start_off = 0
                             try:
