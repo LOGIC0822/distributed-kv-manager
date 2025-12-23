@@ -119,7 +119,10 @@ class DKVOffloadingConnector(KVConnectorBase_V1):  # type: ignore[misc]
         self._logger = logging.getLogger(self.__class__.__name__)
         # 在 engine 层创建核心实现，并由本类1:1转发
         self._core: V1KVEngineImpl = init_v1_engine(vllm_config, role)
-        self._logger.info("DKVOffloadingConnector(thin) forwarding to engine.v1 core, role=%s", getattr(role, "name", "?"))
+        self._logger.info(
+            "DKVOffloadingConnector(thin) forwarding to engine.v1 core, role=%s",
+            getattr(role, "name", "?"),
+        )
 
     # Worker-side -------------------------------------------------------
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):

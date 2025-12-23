@@ -399,6 +399,8 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                 create_folder=False,
             )
             req_id = getattr(request, "request_id", getattr(request, "req_id", "?"))
+            if num_tokens_to_check <= 0:
+                return 0, False
 
             # 如果 v1 元数据不可用，视为无 External Cache：直接 miss，不做磁盘存在性检查
             if self._v1_meta is None:
@@ -457,24 +459,27 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                 getattr(f, "identifier", "")
                 for f in (getattr(new_req, "mm_features", []) or [])
             ]
+            num_tokens_to_check = _align_to_block_size(
+                len(token_ids) - 1, self._block_size
+            )
+            if num_tokens_to_check <= 0:
+                continue
+            aligned_tokens = token_ids[:num_tokens_to_check]
             if getattr(new_req, "req_id", None) in self._requests_need_load:
                 logger.info(
                     "[v1_engine] build_connector_meta: new_req=%s -> LOAD",
                     getattr(new_req, "req_id", None),
                 )
                 meta.add_request(
-                    token_ids=token_ids,
+                    token_ids=aligned_tokens,
                     block_ids=(getattr(new_req, "block_ids", [[0]]) or [[0]])[0],
                     block_size=self._block_size,
                     is_store=False,
                     mm_hashes=mm_hashes,
                 )
             else:
-                num_tokens_to_check = _align_to_block_size(
-                    len(token_ids) - 1, self._block_size
-                )
                 folder = self._generate_foldername_debug(
-                    torch.tensor(token_ids)[:num_tokens_to_check],
+                    torch.tensor(aligned_tokens),
                     mm_hashes,
                     create_folder=False,
                 )
@@ -491,7 +496,7 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                         False,
                     )
                     meta.add_request(
-                        token_ids=token_ids,
+                        token_ids=aligned_tokens,
                         block_ids=(getattr(new_req, "block_ids", [[0]]) or [[0]])[
                             0
                         ],
@@ -519,7 +524,7 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                             getattr(new_req, "req_id", None),
                         )
                         meta.add_request(
-                            token_ids=token_ids,
+                            token_ids=aligned_tokens,
                             block_ids=(
                                 getattr(new_req, "block_ids", [[0]]) or [[0]]
                             )[0],
