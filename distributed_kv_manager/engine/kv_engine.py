@@ -1594,6 +1594,22 @@ def init_engine(config=None, config_path: Optional[str] = None):
     """
     global _engine_singleton
     if _engine_singleton is None:
+        if config_path is None and config is not None:
+            try:
+                kvt = getattr(config, "kv_transfer_config", None)
+                cfg_path = getattr(kvt, "config_path", None) if kvt is not None else None
+                if not cfg_path and kvt is not None:
+                    extra = getattr(kvt, "kv_connector_extra_config", None)
+                    if isinstance(extra, dict):
+                        cfg_path = extra.get("config_path")
+                if not cfg_path and kvt is not None:
+                    extra = getattr(kvt, "extra_config", None)
+                    if isinstance(extra, dict):
+                        cfg_path = extra.get("config_path")
+                if cfg_path:
+                    config_path = cfg_path
+            except Exception:
+                pass
         # 如果没有提供config，则从配置文件加载
         if config is None:
             config = load_config_from_json(config_path) if config_path is not None else load_config_from_json()

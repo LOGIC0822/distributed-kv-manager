@@ -113,7 +113,8 @@ class V1KVEngineImpl(KVConnectorBase_V1):
 
             # 优先用 config.json 里的 kv_transfer_config
             try:
-                cfg_json = load_config_from_json()
+                cfg_path = self._get_config_path(vllm_config)
+                cfg_json = load_config_from_json(cfg_path) if cfg_path else load_config_from_json()
                 kvt_json = getattr(cfg_json, "kv_transfer_config", None)
             except Exception:
                 kvt_json = None
@@ -582,6 +583,27 @@ class V1KVEngineImpl(KVConnectorBase_V1):
 
     # ---------------- helpers ----------------
 
+    def _get_config_path(self, vllm_config: Any) -> Optional[str]:
+        try:
+            kvt = getattr(vllm_config, "kv_transfer_config", None)
+            if kvt is not None:
+                path = getattr(kvt, "config_path", None)
+                if path:
+                    return str(path)
+                extra = getattr(kvt, "kv_connector_extra_config", None)
+                if isinstance(extra, dict):
+                    p = extra.get("config_path")
+                    if p:
+                        return str(p)
+                extra = getattr(kvt, "extra_config", None)
+                if isinstance(extra, dict):
+                    p = extra.get("config_path")
+                    if p:
+                        return str(p)
+        except Exception:
+            pass
+        return None
+
     def _resolve_dkv_path(self, vllm_config: Any) -> Optional[str]:
         """从 kv_transfer_config / config.json 解析 dkv_storage_path."""
         # 1) 先看 vllm_config.kv_transfer_config 是否显式提供 dkv_storage_path
@@ -601,7 +623,8 @@ class V1KVEngineImpl(KVConnectorBase_V1):
 
         # 2) 否则从 config.json.kv_transfer_config 读取
         try:
-            cfg = load_config_from_json()
+            cfg_path = self._get_config_path(vllm_config)
+            cfg = load_config_from_json(cfg_path) if cfg_path else load_config_from_json()
             kvt_json = getattr(cfg, "kv_transfer_config", None)
             if kvt_json is not None:
                 path = getattr(kvt_json, "dkv_storage_path", None)
