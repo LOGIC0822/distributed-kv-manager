@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator
 from types import SimpleNamespace
+import hashlib
 
 import logging
 import torch
@@ -67,18 +68,29 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
         role: KVConnectorRole,
         kv_cache_config: KVCacheConfig | None = None,
     ):
-        super().__init__(vllm_config, role, kv_cache_config)
+        # KVConnectorBase_V1 only takes (vllm_config, role); kv_cache_config kept for signature parity.
+        super().__init__(vllm_config, role)
         self.vllm_config = vllm_config
-        self.role = role
         self._engine = init_engine(vllm_config)
         self._logger = logging.getLogger(self.__class__.__name__)
         self._logger.info("DKVOffloadingConnector initialized (role=%s)", role.name)
+        try:
+            self._block_size = int(getattr(getattr(vllm_config, "v1_config", None), "gpu_block_size", 16))
+        except Exception:
+            try:
+                self._block_size = int(getattr(vllm_config, "gpu_block_size", 16))
+            except Exception:
+                self._block_size = 16
 
         # lazy state used by scheduler
         self._requests: dict[str, Request] = {}
         self._request_block_ids: dict[str, list[int]] = {}
-        # remember last planned token end per request to build incremental slices
+        # remember last planned stored token end per request to build incremental slices
         self._planned_end_token: dict[str, int] = {}
+        # mark requests that should load from external KV (scheduler sets via get_num_new_matched_tokens)
+        self._requests_need_load: dict[str, Request] = {}
+        # stable key cache per request to ensure all slices share the same prompt hash
+        self._stable_key_cache: dict[str, str] = {}
 
     # --------------- Worker-side API ---------------
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -145,8 +157,15 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int, bool]:
-        # We don't perform remote hits here; return 0 to avoid extra async loads.
-        return 0, False
+        # 尝试基于完整 prompt 判断是否已有外部缓存可复用。
+        matched_tokens = self._find_hit_tokens(request)
+        if matched_tokens <= 0:
+            return 0, False
+        # 记录命中以便后续 build_connector_meta 下发加载计划
+        self._requests_need_load[request.request_id] = request
+        # 返回还需加载的 token 数（scheduler 期望对齐块大小）
+        delta = max(0, matched_tokens - num_computed_tokens)
+        return delta, False
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -156,6 +175,9 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
         block_groups = blocks.get_block_ids()
         block_ids = block_groups[0]
         self._request_block_ids[request.request_id] = block_ids
+        if num_external_tokens > 0:
+            # scheduler 认为有外部 token 可用，标记为需要加载
+            self._requests_need_load[request.request_id] = request
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         # Plan: for each request, store any newly produced prompt tokens since last plan.
@@ -167,16 +189,24 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
             req = self._requests.get(req_id)
             if req is None:
                 continue
-            new_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            if new_tokens <= 0:
+            total_tokens = len(getattr(req, "prompt_token_ids", []) or getattr(req, "input_ids", []) or [])
+            aligned_full = (total_tokens // self._block_size) * self._block_size
+            if aligned_full <= 0:
                 continue
-            prev_end = self._planned_end_token.get(req_id, 0)
-            end_tok = req.num_computed_tokens + new_tokens
-            if end_tok > prev_end:
-                reqs_to_store.setdefault(req_id, []).append(
-                    DKVTransferItem(req_id, prev_end, end_tok)
+            # 若此前判定可命中，则准备加载计划；否则准备存储计划
+            if req_id in self._requests_need_load:
+                reqs_to_load.setdefault(req_id, []).append(
+                    DKVTransferItem(req_id, 0, aligned_full)
                 )
-                self._planned_end_token[req_id] = end_tok
+                self._logger.info("[v1_conn] plan load req=%s span=[0,%d)", req_id, aligned_full)
+            else:
+                prev_stored = self._planned_end_token.get(req_id, 0)
+                if prev_stored < aligned_full:
+                    reqs_to_store.setdefault(req_id, []).append(
+                        DKVTransferItem(req_id, 0, aligned_full)
+                    )
+                    self._planned_end_token[req_id] = aligned_full
+                    self._logger.info("[v1_conn] plan store req=%s span=[0,%d)", req_id, aligned_full)
 
         # cached requests updates
         cached = scheduler_output.scheduled_cached_reqs
@@ -187,21 +217,38 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
             new_block_ids_tuple = cached.new_block_ids[idx]
             # If new blocks allocated, map to token span using gpu_block_size
             try:
-                gpu_bs = self.vllm_config.v1_config.gpu_block_size
+                gpu_bs = int(getattr(self.vllm_config.v1_config, "gpu_block_size", 16))
             except Exception:
-                gpu_bs = getattr(self.vllm_config, "gpu_block_size", 16)
+                gpu_bs = int(getattr(self.vllm_config, "gpu_block_size", 16))
             if not new_block_ids_tuple:
                 continue
-            # Compute token span for the new contiguous block run
-            # Simple heuristic: from min(new_block_ids) to max(new_block_ids)+1 in tokens
-            min_blk = min(new_block_ids_tuple)
-            max_blk = max(new_block_ids_tuple)
-            start_tok = min_blk * gpu_bs
+            # new_block_ids_tuple may be nested; flatten to ints
+            flat_blocks: list[int] = []
+            def _flatten(obj):
+                if isinstance(obj, (list, tuple)):
+                    for el in obj:
+                        _flatten(el)
+                else:
+                    try:
+                        flat_blocks.append(int(obj))
+                    except Exception:
+                        pass
+            _flatten(new_block_ids_tuple)
+            if not flat_blocks:
+                continue
+            min_blk = min(flat_blocks)
+            max_blk = max(flat_blocks)
+            start_tok = 0  # store from prefix to keep key stable
             end_tok = (max_blk + 1) * gpu_bs
+            total_tokens = len(getattr(req, "prompt_token_ids", []) or getattr(req, "input_ids", []) or [])
+            aligned_full = (total_tokens // self._block_size) * self._block_size
+            end_tok = min(end_tok, aligned_full)
+            if end_tok <= start_tok or aligned_full <= 0:
+                continue
             prev_end = self._planned_end_token.get(req_id, 0)
             if end_tok > prev_end:
                 reqs_to_store.setdefault(req_id, []).append(
-                    DKVTransferItem(req_id, max(prev_end, start_tok), end_tok)
+                    DKVTransferItem(req_id, start_tok, end_tok)
                 )
                 self._planned_end_token[req_id] = end_tok
 
@@ -215,6 +262,8 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
         except Exception:
             self._last_forward_context = None
         self._connector_metadata = meta
+        # 新一轮计划后清理待加载标记（只用一次）
+        self._requests_need_load.clear()
         return meta
 
     def update_connector_output(self, connector_output: Any):
@@ -231,6 +280,7 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
         self._requests.pop(req_id, None)
         self._request_block_ids.pop(req_id, None)
         self._planned_end_token.pop(req_id, None)
+        self._stable_key_cache.pop(req_id, None)
         return False, None
 
     def take_events(self) -> Iterable:
@@ -243,16 +293,14 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
         # We assume single-sequence per request for prompt phase; extend as needed for batched
         mi = SimpleNamespace()
         # Request carries prompt token ids in req.input_ids (list[int]) or tensor; normalize to tensor
-        input_ids = getattr(req, "input_ids", None)
-        if input_ids is None:
+        input_tokens = self._get_aligned_prompt_tokens(req, self._infer_device(fc))
+        if input_tokens is None or input_tokens.numel() == 0:
             return
-        if not torch.is_tensor(input_ids):
-            input_tokens = torch.tensor(input_ids, dtype=torch.long, device=self._infer_device(fc))
-        else:
-            input_tokens = input_ids
+        base_key = self._get_or_build_stable_key(req, input_tokens, layer_id=0)
         mi.input_tokens = input_tokens
         sa = SimpleNamespace()
-        sa.seq_lens = [int(input_tokens.shape[0])]
+        seq_len = int(input_tokens.shape[0])
+        sa.seq_lens = [seq_len]
         # Build slot mapping 0..N-1 as a fallback; v1 maintains internal maps but we only need contiguous indices
         sa.slot_mapping = torch.arange(sa.seq_lens[0], device=input_tokens.device)
         mi.attn_metadata = sa
@@ -263,6 +311,8 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
             sid = b"v1_session"
         mi.session_id = sid
         mi.layer_id = 0
+        # keep a stable filename (hash of full prompt) to avoid metadata truncation
+        mi.stable_key = f"{base_key}_off0_len{seq_len}.pt"
 
         # Pack kv_caches as a list ordered by model layers, using fc.kv_caches if available
         kv_caches = self._collect_kv_caches(fc)
@@ -273,16 +323,14 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
         # Slice the prompt tokens and kv caches for the requested span and call engine.store_kv
         if end_tok <= start_tok:
             return
-        input_ids = getattr(req, "input_ids", None)
-        if input_ids is None:
-            return
         dev = self._infer_device(fc)
-        if not torch.is_tensor(input_ids):
-            full_tokens = torch.tensor(input_ids, dtype=torch.long, device=dev)
-        else:
-            full_tokens = input_ids
-        curr_tokens = full_tokens[start_tok:end_tok]
+        aligned_tokens = self._get_aligned_prompt_tokens(req, dev)
+        if aligned_tokens is None or aligned_tokens.numel() == 0:
+            return
+        curr_tokens = aligned_tokens[start_tok:end_tok]
         seq_len = int(curr_tokens.shape[0])
+        base_key = self._get_or_build_stable_key(req, aligned_tokens, layer_id=0)
+        block_key = f"{base_key}_off{start_tok}_len{seq_len}.pt"
 
         # Build small model_input namespace
         mi = SimpleNamespace()
@@ -299,6 +347,7 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
         mi.layer_id = 0
         # Annotate token_offset to let engine write absolute offsets into metadata
         mi.payload_meta = {"token_offset": int(start_tok), "block_size": int(seq_len)}
+        mi.stable_key = block_key
 
         kv_caches = self._collect_kv_caches(fc, span=(start_tok, end_tok))
         ss = should_store(mi)
@@ -339,12 +388,104 @@ class DKVOffloadingConnector(KVConnectorBase_V1):
         except Exception:
             return []
 
+    def _get_aligned_prompt_tokens(self, req: "Request", device: torch.device) -> torch.Tensor | None:
+        tokens = getattr(req, "prompt_token_ids", None) or getattr(req, "input_ids", None)
+        if tokens is None:
+            return None
+        if not torch.is_tensor(tokens):
+            tok_tensor = torch.tensor(tokens, dtype=torch.long, device=device)
+        else:
+            tok_tensor = tokens.to(device=device)
+        aligned_len = (int(tok_tensor.shape[0]) // self._block_size) * self._block_size
+        if aligned_len <= 0:
+            return None
+        return tok_tensor[:aligned_len]
+
+    def _build_model_input(self, token_ids: torch.Tensor, slot_mapping: torch.Tensor) -> Any:
+        dev = token_ids.device if token_ids.is_cuda else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        toks = token_ids.to(dev)
+        smap = slot_mapping.to(dev)
+        mi = SimpleNamespace()
+        mi.input_tokens = toks
+        sa = SimpleNamespace()
+        sa.seq_lens = [int(smap.numel())]
+        sa.slot_mapping = smap
+        mi.attn_metadata = sa
+        mi.session_id = None
+        mi.layer_id = 0
+        mi.payload_meta = {"token_offset": 0, "block_size": int(smap.numel())}
+        return mi
+
+    def _make_transfer_item(self, req_id: str, block_ids: list[int]) -> DKVTransferItem:
+        if not block_ids:
+            return DKVTransferItem(req_id, 0, 0)
+        bs = self._block_size
+        start = min(block_ids) * bs
+        end = (max(block_ids) + 1) * bs
+        return DKVTransferItem(req_id=req_id, start_token=start, end_token=end)
+
+    def _find_hit_tokens(self, req: "Request") -> int:
+        """调用引擎 should_retrieve 判定是否已有完整前缀命中，返回可复用长度。"""
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        aligned_tokens = self._get_aligned_prompt_tokens(req, dev)
+        if aligned_tokens is None or aligned_tokens.numel() == 0:
+            return 0
+        seq_len = int(aligned_tokens.shape[0])
+        smap = torch.arange(seq_len, device=dev)
+        mi = SimpleNamespace()
+        mi.input_tokens = aligned_tokens
+        sa = SimpleNamespace()
+        sa.seq_lens = [seq_len]
+        sa.slot_mapping = smap
+        mi.attn_metadata = sa
+        mi.session_id = str(getattr(req, "request_id", "v1_session")).encode("utf-8")
+        mi.layer_id = 0
+        mi.stable_key = f"{self._get_or_build_stable_key(req, aligned_tokens, 0)}_off0_len{seq_len}.pt"
+        rs = should_retrieve(mi)
+        # 判定枚举命中
+        try:
+            if rs is None:
+                return 0
+            if hasattr(rs, "name"):
+                return seq_len if rs.name.lower() == "hit" else 0
+            if str(rs).lower().endswith("hit"):
+                return seq_len
+        except Exception:
+            return 0
+        return 0
+
     def _infer_device(self, fc: Any) -> torch.device:
         try:
             device = next(fc.model.parameters()).device
         except Exception:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return device
+
+    # --------------- Stable key helpers ---------------
+    def _session_hash(self, session_bytes: bytes) -> str:
+        try:
+            return hashlib.blake2b(session_bytes, digest_size=8).hexdigest()
+        except Exception:
+            return "session"
+
+    def _get_or_build_stable_key(self, req: "Request", full_tokens: torch.Tensor, layer_id: int = 0) -> str:
+        """基于完整 prompt 生成稳定文件名前缀，所有块共享同一哈希。"""
+        req_id = getattr(req, "request_id", None)
+        if req_id is not None and req_id in self._stable_key_cache:
+            return self._stable_key_cache[req_id]
+        try:
+            full_hash = self._engine._tensor_hash(full_tokens)
+        except Exception:
+            full_hash = "nohash"
+        try:
+            sid_bytes = str(req_id or "v1_session").encode("utf-8")
+        except Exception:
+            sid_bytes = b"v1_session"
+        session_part = self._session_hash(sid_bytes)
+        base = f"kv_s{session_part}_l{layer_id}_{full_hash}"
+        if req_id is not None:
+            self._stable_key_cache[req_id] = base
+        return base
 
     # --------------- Cleanup ---------------
     def close(self):

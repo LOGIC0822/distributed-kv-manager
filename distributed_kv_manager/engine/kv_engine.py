@@ -18,14 +18,17 @@ from distributed_kv_manager.storage.base import AbstractStorage
 
 # ------------------ Logger 配置 ------------------ #
 logger = logging.getLogger("KVEngine")
-logger.setLevel(logging.DEBUG)
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-formatter = logging.Formatter(
-    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-ch.setFormatter(formatter)
-logger.addHandler(ch)
+_log_level_name = os.getenv("KV_LOG_LEVEL", "INFO").upper()
+_log_level = getattr(logging, _log_level_name, logging.INFO)
+logger.setLevel(_log_level)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(_log_level)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
 
 class KVEngine(DistributedKVEngineBase):
     """
@@ -36,8 +39,48 @@ class KVEngine(DistributedKVEngineBase):
         self.rank = getattr(config, "rank", 0)
         self.local_rank = getattr(config, "local_rank", 0)
         self.config = config
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        # 最小存储阈值（按 token 数），小于该阈值的序列不落盘
+        extra_cfg = getattr(getattr(config, "kv_transfer_config", None), "extra_config", None)
+
+        def _get_extra(name: str, default=None):
+            if isinstance(extra_cfg, dict) and name in extra_cfg:
+                return extra_cfg.get(name)
+            return default
+
+        try:
+            self._min_store_tokens = int(_get_extra("min_store_tokens", 16))
+        except Exception:
+            self._min_store_tokens = 16
+
+        # 写入线程池（支持配置覆盖）
+        workers = (
+            os.getenv("KV_STORE_WORKERS")
+            or _get_extra("store_thread_workers", None)
+            or _get_extra("kv_store_workers", None)
+            or _get_extra("store_workers", None)
+        )
+        try:
+            workers = int(workers) if workers is not None else 4
+        except Exception:
+            workers = 4
+        self._executor = ThreadPoolExecutor(max_workers=workers)
         self._futures = []
+
+        # 基础性能指标
+        perf_interval = (
+            os.getenv("KV_PERF_LOG_INTERVAL")
+            or _get_extra("perf_log_interval_s", None)
+            or _get_extra("perf_log_interval", 60)
+        )
+        try:
+            self._perf_log_interval_s = max(1.0, float(perf_interval))
+        except Exception:
+            self._perf_log_interval_s = 60.0
+        perf_on = os.getenv("KV_PERF_LOG", "1")
+        self._perf_enabled = str(perf_on).lower() not in ("0", "false", "none")
+        self._perf_stats: dict = {}
+        self._perf_last_log = time.time()
+
         # 最近一次检索统计（便于外部读取验证节省量）
         self._last_retrieve_stats: dict = {}
 
@@ -64,8 +107,12 @@ class KVEngine(DistributedKVEngineBase):
         self._cleanup_manager.start()
 
         # debug dump config
-        self._debug_dump: bool = bool(getattr(config.kv_transfer_config, "enable_debug_dump", False))
-        self._debug_dump_file: Optional[str] = getattr(config.kv_transfer_config, "debug_dump_file", None)
+        env_debug = os.getenv("KV_DEBUG_DUMP", "")
+        env_debug_on = str(env_debug).lower() not in ("", "0", "false", "none")
+        self._debug_dump: bool = bool(getattr(config.kv_transfer_config, "enable_debug_dump", False) or env_debug_on)
+        self._debug_dump_file: Optional[str] = getattr(
+            config.kv_transfer_config, "debug_dump_file", None
+        ) or os.getenv("KV_DEBUG_DUMP_FILE", None)
         if self._debug_dump:
             self._maybe_setup_debug_file_handler()
 
@@ -192,11 +239,10 @@ class KVEngine(DistributedKVEngineBase):
         return deleted_backend
 
     # ------------------ KV 存储/检索 ------------------ #
-    def should_store(self, model_input) -> StoreStatus:
-        # 简单策略：总是存
+    def should_store(self, model_input, **kwargs) -> StoreStatus:
         return StoreStatus.STORED
 
-    def should_retrieve(self, model_input) -> RetrieveStatus:
+    def should_retrieve(self, model_input, **kwargs) -> RetrieveStatus:
         """
         判断 KV 是否命中缓存，通过元数据缓存确认：
         - status == 1 表示写入完成，可以命中
@@ -204,17 +250,20 @@ class KVEngine(DistributedKVEngineBase):
         """
         input_tokens = model_input.input_tokens
         seq_lens = model_input.attn_metadata.seq_lens
+        stable_key_arg = kwargs.get("stable_key")
 
         for seq_idx, seq_len in enumerate(seq_lens):
             start_pos = sum(seq_lens[:seq_idx])
             end_pos = start_pos + seq_len
             current_tokens = input_tokens[start_pos:end_pos]
-            # 获取session_id和layer_id
             session_id = getattr(model_input, "session_id", None)
             layer_id = getattr(model_input, "layer_id", None)
-            file_path = self._make_key(current_tokens, session_id, layer_id)
+            stable_key_override = stable_key_arg
+            session_str = session_id.hex() if isinstance(session_id, (bytes, bytearray)) else str(session_id or "session_0000")
+            default_stable_key = f"kv_{session_str}_layer_{layer_id or 0}_seq{seq_idx}.pt"
+            stable_key = stable_key_override or default_stable_key
+            file_path = self._make_key(current_tokens, session_id, layer_id, stable_key=stable_key)
 
-            # 从 MetadataCache 访问元数据
             meta = self._meta_cache.get_metadata(
                 key=file_path,
                 layer_id=layer_id,
@@ -222,17 +271,33 @@ class KVEngine(DistributedKVEngineBase):
             )
 
             if meta is None or meta.status != 1:
-                # 元数据不存在或者状态不是已提交，则 MISS
                 return RetrieveStatus.MISS
-                
-            # 检查元数据是否已过期
+            try:
+                kv_bytes_exist = self._storage_download_kv_bytes(file_path)
+                if kv_bytes_exist is None:
+                    return RetrieveStatus.MISS
+                info_exist = self._storage.extract_payload_info(kv_bytes_exist)
+                pm_exist = info_exist.get("payload_meta", {}) if isinstance(info_exist, dict) else {}
+                exist_slots_len = int(pm_exist.get("slots_len", 0) or 0)
+                if exist_slots_len < int(getattr(self, "_min_store_tokens", 16)):
+                    return RetrieveStatus.MISS
+                try:
+                    expected_hash = self._get_cached_tokens_hash(
+                        model_input,
+                        seq_idx,
+                        current_tokens,
+                        length=exist_slots_len if exist_slots_len > 0 else None,
+                    )
+                    stored_hash = str(pm_exist.get("tokens_hash", "")) if isinstance(pm_exist, dict) else ""
+                    if not stored_hash or stored_hash != expected_hash:
+                        return RetrieveStatus.MISS
+                except Exception:
+                    return RetrieveStatus.MISS
+            except Exception:
+                return RetrieveStatus.MISS
             if meta.is_expired():
-                # 元数据已过期，则 MISS
-                logger.debug(f"元数据已过期: {file_path}")
                 return RetrieveStatus.MISS
 
-        # 所有序列都存在且已提交
-        logger.debug(f"KV Cache 命中")
         return RetrieveStatus.HIT
 
     def store_kv(
@@ -245,6 +310,7 @@ class KVEngine(DistributedKVEngineBase):
         kv_caches,
         store_status,
         hidden_or_intermediate_states=None,
+        **kwargs
         ):
         """基于元数据缓存的两阶段提交写入 KV 缓存（异步提交）。
 
@@ -252,10 +318,16 @@ class KVEngine(DistributedKVEngineBase):
             hidden_or_intermediate_states: 兼容旧接口的占位参数（当前未使用）。
         """
         _ = hidden_or_intermediate_states  # 占位以保持接口兼容
+        
+        # 显式参数传递 override
+        stable_key_arg = kwargs.get("stable_key")
+        
         input_tokens = model_input.input_tokens
         seq_lens = model_input.attn_metadata.seq_lens
         slot_mapping = model_input.attn_metadata.slot_mapping  # 保持二维形状
         num_layers = len(kv_caches)
+        store_start_ts = time.time()
+        total_tokens = int(sum(int(x) for x in seq_lens))
 
         for seq_idx, seq_len in enumerate(seq_lens):
             start_pos = sum(seq_lens[:seq_idx])
@@ -264,7 +336,16 @@ class KVEngine(DistributedKVEngineBase):
             # 获取session_id和layer_id
             session_id = getattr(model_input, "session_id", None)
             layer_id = getattr(model_input, "layer_id", None)
-            file_path = self._make_key(current_tokens, session_id, layer_id)
+            # 分块场景下，为同一序列使用稳定键，避免因切片不同导致 key 不一致
+            stable_key_override = stable_key_arg or getattr(model_input, "stable_key", None)
+            session_str = session_id.hex() if isinstance(session_id, (bytes, bytearray)) else str(session_id or "session_0000")
+            try:
+                seq_hash = self._get_cached_tokens_hash(model_input, seq_idx, current_tokens)
+            except Exception:
+                seq_hash = "empty"
+            stable_key = stable_key_override or f"kv_{session_str}_layer_{layer_id or 0}_seq{seq_idx}_{seq_hash}.pt"
+            stable_key_prefix = (stable_key[:-3] if isinstance(stable_key, str) and stable_key.endswith(".pt") else stable_key)
+            file_path = self._make_key(current_tokens, session_id, layer_id, stable_key=stable_key)
 
             # ------------------ 第一步：查询元数据缓存（仅记录，是否跳过/升级在计算长度后决定） ------------------ #
             existing_meta = self._meta_cache.get_metadata(
@@ -315,8 +396,11 @@ class KVEngine(DistributedKVEngineBase):
             if min_take_len <= 0:
                 logger.warning("序列 %s 在各层无可用 KV token，跳过存储", file_path)
                 continue
+            if int(min_take_len) < int(getattr(self, "_min_store_tokens", 16)):
+                logger.debug("序列 %s 可用长度(%d)小于最小存储阈值(%d)，跳过存储", file_path, int(min_take_len), int(getattr(self, "_min_store_tokens", 16)))
+                continue
 
-            # 若上游槽位映射过长，裁剪后再持久化
+            # 先初始化 persisted_slots，稍后根据已存在长度进行重切片
             persisted_slots = resolved_slots[:min_take_len]
 
             # 如果存在已提交的旧条目，检查是否需要“升级”（从更短长度升级到更长）
@@ -330,31 +414,42 @@ class KVEngine(DistributedKVEngineBase):
                         existing_slots_len = int(pm_exist.get("slots_len", 0) or 0)
                 except Exception:
                     existing_slots_len = None
-                if existing_slots_len is not None and existing_slots_len >= min_take_len:
-                    logger.debug(
-                        f"序列 {file_path} 已存在缓存且长度 {existing_slots_len} >= 期望 {min_take_len}，跳过存储"
-                    )
-                    continue
-                elif existing_slots_len is not None and existing_slots_len < min_take_len:
-                    logger.debug(
-                        f"序列 {file_path} 触发升级存储: 旧长度={existing_slots_len} -> 新长度={min_take_len}"
-                    )
+            persist_start = int(existing_slots_len or 0)
+            persist_len = max(0, min(int(min_take_len), int(seq_len - persist_start)))
+            if persist_len <= 0:
+                logger.debug(
+                    "序列 %s persist_len<=0 跳过存储, start=%d seq_len=%d min_take=%d",
+                    file_path, persist_start, seq_len, min_take_len
+                )
+                continue
+            persisted_slots = resolved_slots[persist_start:persist_start + persist_len]
 
             # 第二遍：按统一长度收集各层 KV
             all_keys, all_values = [], []
             for layer_idx in range(num_layers):
                 kv_cache = kv_caches[layer_idx]
                 key_cache, value_cache = self.split_kv_cache(kv_cache)
-                # 统一视图：将 token 维度展平为 [-1, num_heads, head_dim]，再按槽位 gather
                 if key_cache.dim() < 3:
                     continue
                 num_heads = int(key_cache.shape[-2])
                 head_dim = int(key_cache.shape[-1])
-                key_view = key_cache.reshape(-1, num_heads, head_dim)
-                value_view = value_cache.reshape(-1, num_heads, head_dim)
-                selected_indices = persisted_slots  # shape [min_take_len]
-                selected_k = key_view[selected_indices]
-                selected_v = value_view[selected_indices]
+                import torch as _torch
+                gseq = _torch.arange(int(persist_len), dtype=_torch.long, device=current_tokens.device)
+                if key_cache.dim() == 4:
+                    try:
+                        selected_k = key_cache[seq_idx][gseq]
+                        selected_v = value_cache[seq_idx][gseq]
+                    except Exception as e:
+                        logger.error("store gather dim4 failed: %s", e, exc_info=True)
+                        continue
+                else:
+                    global_idx = gseq + int(start_pos) + int(persist_start)
+                    try:
+                        selected_k = key_cache[global_idx]
+                        selected_v = value_cache[global_idx]
+                    except Exception as e:
+                        logger.error("store gather dim3 failed: %s", e, exc_info=True)
+                        continue
                 all_keys.append(selected_k.unsqueeze(0))
                 all_values.append(selected_v.unsqueeze(0))
 
@@ -368,8 +463,12 @@ class KVEngine(DistributedKVEngineBase):
                 continue
 
             # tokens/roi 与存储的 KV 对齐
-            selected_tokens = current_tokens[:min_take_len]
-            roi = torch.ones(min_take_len, dtype=torch.bool, device=selected_tokens.device)
+            selected_tokens = current_tokens[persist_start:persist_start + persist_len]
+            try:
+                selected_tokens_hash = self._tensor_hash(selected_tokens)
+            except Exception:
+                selected_tokens_hash = "empty"
+            roi = torch.ones(persist_len, dtype=torch.bool, device=selected_tokens.device)
 
             # ------------------ 第四步：写入元数据缓存（锁定状态），再异步写入 KV 并更新元数据 ------------------ #
             # 读取配置的过期时间，默认1天
@@ -385,8 +484,8 @@ class KVEngine(DistributedKVEngineBase):
                     override_offset = int(connector_payload_meta["token_offset"])
             except Exception:
                 override_offset = None
-            meta_start_pos = override_offset if override_offset is not None else start_pos
-            meta_end_pos = meta_start_pos + min_take_len
+            meta_start_pos = (override_offset if override_offset is not None else (start_pos + persist_start))
+            meta_end_pos = meta_start_pos + persist_len
 
             # 若已存在元数据，则复用并短暂置为写入中；否则新建
             if existing_meta is not None:
@@ -430,6 +529,7 @@ class KVEngine(DistributedKVEngineBase):
                     roi,
                     current_slots,
                     meta,
+                    tokens_hash=None,
                     connector_payload_meta=None,
                 ):
                     self.engine = engine
@@ -441,20 +541,31 @@ class KVEngine(DistributedKVEngineBase):
                     self.roi = roi
                     self.current_slots = current_slots
                     self.meta = meta
+                    self.tokens_hash = tokens_hash
                     self.connector_payload_meta = connector_payload_meta
                 
                 def __call__(self):
                     try:
                         logger.debug(f"开始处理序列 {self.seq_idx}: {self.file_path}")
+                        try:
+                            self.all_keys = self.all_keys.detach().cpu()
+                            self.all_values = self.all_values.detach().cpu()
+                            self.current_tokens = self.current_tokens.detach().cpu()
+                            self.current_slots = self.current_slots.detach().cpu()
+                        except Exception:
+                            pass
                         
                         # 构造 payload_meta
                         payload_meta = {
                             "schema_version": 1,
-                            "tokens_hash": self.engine._tensor_hash(self.current_tokens),
+                            "tokens_hash": self.tokens_hash
+                            if self.tokens_hash is not None
+                            else self.engine._tensor_hash(self.current_tokens),
                             "num_layers": int(self.all_keys.shape[0]) if self.all_keys.numel() > 0 else 0,
                             "kv_dtype": str(self.all_keys.dtype) if self.all_keys.numel() > 0 else "unknown",
                             "kv_tail_shape": list(self.all_keys.shape[2:]) if self.all_keys.numel() > 0 else [],
                             "slots_len": int(self.current_slots.numel()),
+                            "token_offset": meta_start_pos,
                         }
 
                         # If the connector attached a payload_meta to the model_input
@@ -471,11 +582,47 @@ class KVEngine(DistributedKVEngineBase):
                         except Exception:
                             pass
 
-                        # 写入存储（包含slot_mapping与payload_meta）
+                        try:
+                            kvb_exist = self.engine._storage_download_kv_bytes(self.file_path)
+                            if kvb_exist is not None:
+                                k_old, v_old = self.engine._storage.unpack_kv_data(kvb_exist)
+                            else:
+                                k_old, v_old = None, None
+                        except Exception:
+                            k_old, v_old = None, None
+                        if k_old is not None and v_old is not None:
+                            import torch as _torch
+                            old_len = int(k_old.shape[1]) if k_old.dim() >= 2 else 0
+                            start_off = 0
+                            try:
+                                pm = self.engine._storage.extract_payload_info(kvb_exist).get("payload_meta", {}) if kvb_exist is not None else {}
+                                start_off = int(pm.get("token_offset", 0) or 0)
+                            except Exception:
+                                start_off = 0
+                            new_off = int(payload_meta.get("token_offset", start_off))
+                            end_len = max(old_len, new_off + int(self.current_slots.numel()))
+                            num_layers = int(self.all_keys.shape[0])
+                            num_heads = int(self.all_keys.shape[-2])
+                            head_dim = int(self.all_keys.shape[-1])
+                            k_merged = _torch.empty((num_layers, end_len, num_heads, head_dim), dtype=self.all_keys.dtype)
+                            v_merged = _torch.empty((num_layers, end_len, num_heads, head_dim), dtype=self.all_values.dtype)
+                            k_merged[:, :old_len] = k_old.to(dtype=self.all_keys.dtype)
+                            v_merged[:, :old_len] = v_old.to(dtype=self.all_values.dtype)
+                            seg_len = int(self.current_slots.numel())
+                            if seg_len > 0:
+                                k_merged[:, new_off:new_off+seg_len] = self.all_keys
+                                v_merged[:, new_off:new_off+seg_len] = self.all_values
+                            final_keys = k_merged
+                            final_values = v_merged
+                            payload_meta["slots_len"] = end_len
+                        else:
+                            final_keys = self.all_keys
+                            final_values = self.all_values
+                            payload_meta["slots_len"] = int(self.current_slots.numel())
                         self.engine._storage_insert(
                             self.file_path,
-                            self.all_keys,
-                            self.all_values,
+                            final_keys,
+                            final_values,
                             self.current_tokens,
                             self.roi,
                             self.current_slots,
@@ -515,13 +662,20 @@ class KVEngine(DistributedKVEngineBase):
                 roi,
                 persisted_slots,
                 meta,
+                tokens_hash=selected_tokens_hash,
                 connector_payload_meta=connector_payload_meta,
             )
             future = self._executor.submit(task)
             self._futures.append(future)
 
-    def retrieve_kv(self, model_executable, model_input, kv_caches, retrieve_status):
+        self._perf_record("store_kv", time.time() - store_start_ts, tokens=total_tokens)
+
+    def retrieve_kv(self, model_executable, model_input, kv_caches, retrieve_status, **kwargs):
         """从存储中恢复 KV 缓存，并提供结果。"""
+        # 显式参数传递 override
+        stable_key_arg = kwargs.get("stable_key")
+        retrieve_start_ts = time.time()
+        
         input_tokens = model_input.input_tokens
         seq_lens = model_input.attn_metadata.seq_lens
         slot_mapping = model_input.attn_metadata.slot_mapping  # 保持二维形状
@@ -539,6 +693,33 @@ class KVEngine(DistributedKVEngineBase):
         total_tokens = int(sum(int(x) for x in seq_lens))
         restored_per_seq: list[int] = []
 
+        slot_full_override = None
+
+        # 预先扫描元数据键，避免每个序列重复扫描
+        meta_index: dict[tuple[object, object], list[tuple[str, object]]] = {}
+        etcd_prefix = getattr(self._meta, "prefix", "/kvmeta")
+        try:
+            full_keys = self._meta.scan_all_metadata_keys()
+        except Exception:
+            self._dbg("[retrieve] scan_all_metadata_keys failed")
+            full_keys = []
+        self._dbg(f"[retrieve] scan meta keys count={len(full_keys) if full_keys is not None else 0}")
+        for full_key in full_keys or []:
+            try:
+                rel = full_key
+                if isinstance(rel, str) and rel.startswith(etcd_prefix + "/"):
+                    rel = rel[len(etcd_prefix) + 1 :]
+                if isinstance(rel, str):
+                    rel = rel.lstrip("/")
+                m = self._meta.get_metadata_by_full_key(full_key)
+                if m is None:
+                    continue
+                if getattr(m, "status", None) != 1:
+                    continue
+                meta_index.setdefault((getattr(m, "session_id", None), getattr(m, "layer_id", None)), []).append((rel, m))
+            except Exception:
+                continue
+
         for seq_idx, seq_len in enumerate(seq_lens):
             start_pos = sum(seq_lens[:seq_idx])
             end_pos = start_pos + seq_len
@@ -546,49 +727,41 @@ class KVEngine(DistributedKVEngineBase):
             current_tokens = input_tokens[start_pos:end_pos]
             session_id = getattr(model_input, "session_id", None)
             layer_id = getattr(model_input, "layer_id", None)
-            file_path = self._make_key(current_tokens, session_id, layer_id)
+            stable_key_override = stable_key_arg or getattr(model_input, "stable_key", None)
+            # normalize default session/layer to align with store path generation
+            session_eff = session_id if session_id is not None else b"session_0000"
+            layer_eff = layer_id if layer_id is not None else 0
+            session_str = (session_eff.hex() if isinstance(session_eff, (bytes, bytearray)) else str(session_eff or "session_0000"))
+            # 与 store_kv 对齐：若未显式传入稳定键，则使用基于序号的稳定键
+            try:
+                seq_hash = self._get_cached_tokens_hash(model_input, seq_idx, current_tokens)
+            except Exception:
+                seq_hash = "empty"
+            stable_key = stable_key_override or f"kv_{session_str}_layer_{layer_eff}_seq{seq_idx}_{seq_hash}.pt"
+            file_path = self._make_key(current_tokens, session_eff, layer_eff, stable_key=stable_key)
+            self._dbg(
+                f"[retrieve] seq_idx={seq_idx} key={file_path} seq_len={seq_len} "
+                f"start_pos={start_pos} session={session_str} layer={layer_eff} "
+                f"stable_key={stable_key} override={stable_key_override}"
+            )
+            # 用 stable_key 前缀约束块检索，避免不同输入之间互相聚合
+            stable_key_prefix = (
+                stable_key[:-3] if isinstance(stable_key, str) and stable_key.endswith(".pt") else stable_key
+            )
 
-            meta = self._meta_cache.get_metadata(key=file_path)
-            if meta and meta.is_expired():
-                logger.debug(f"序列 {seq_idx} 元数据已过期: {file_path}")
-                continue
+            # 跳过基础稳定键的哈希/槽位校验，直接尝试聚合块
+            meta = None
+            kv_bytes = None
+            payload_info = {}
+            persisted_slots = None
+            payload_meta = {}
+            expected_layers = None
+            tokens_hash = None
 
-            self._update_last_access_time(file_path)
-
-            # 读取纯KV负载与扩展信息
-            kv_bytes = self._storage_download_kv_bytes(file_path)
-            if kv_bytes is None:
-                logger.debug(f"序列 {seq_idx} 的 KV 数据缺失或损坏（将尝试聚合其他块）: {file_path}")
-                payload_info = {}
-            else:
-                payload_info = self._storage.extract_payload_info(kv_bytes)
-            self._dbg(f"[retrieve] payload_info_keys={list(payload_info.keys()) if isinstance(payload_info, dict) else 'n/a'}")
-
-            # 优先使用持久化的slot_mapping（若存在）
-            persisted_slots = payload_info.get("slot_mapping")
-
-            # 可选一致性校验：token哈希/层数/形状
-            payload_meta = payload_info.get("payload_meta", {}) if isinstance(payload_info, dict) else {}
-            expected_layers = payload_meta.get("num_layers")
-            tokens_hash = payload_meta.get("tokens_hash")
-            self._dbg(f"[retrieve] expected_layers={expected_layers} tokens_hash_present={tokens_hash is not None}")
-
-            # 基础文件（若存在）会作为一个块参与聚合；若不存在则跳过此部分
-            key = None
-            value = None
-            if kv_bytes is not None:
-                try:
-                    # 获取 KV 张量
-                    key, value = self._storage.unpack_kv_data(kv_bytes)
-                except Exception:
-                    key, value = None, None
-                if key is not None and value is not None:
-                    device = input_tokens.device
-                    key = key.to(device)
-                    value = value.to(device)
-                    self._dbg(f"[retrieve] loaded key_shape={tuple(key.shape)} value_shape={tuple(value.shape)}")
+            # 基础文件的收集改为统一通过 _collect_from_file
 
             current_slots = self._resolve_sequence_slots(seq_idx, seq_len, slot_mapping, file_path, start_pos)
+            self._dump_slots_context("retrieve.pre", seq_idx, seq_len, start_pos, file_path, slot_mapping, current_slots)
             if current_slots.numel() == 0:
                 logger.warning("序列 %s 的有效槽位数为0，跳过", file_path)
                 continue
@@ -613,6 +786,7 @@ class KVEngine(DistributedKVEngineBase):
             else:
                 slots_to_use = current_slots
             self._dbg(f"[retrieve] slots_to_use_len={int(slots_to_use.numel())}")
+            self._dump_slots_context("retrieve.use", seq_idx, seq_len, start_pos, file_path, slot_mapping, slots_to_use)
 
             # 轻量校验：层数与token哈希（存在时）
             if expected_layers is not None and int(expected_layers) != len(kv_caches):
@@ -633,10 +807,12 @@ class KVEngine(DistributedKVEngineBase):
                         tokens_len = int(payload_meta.get("slots_len", 0) or 0)
                     if tokens_len <= 0:
                         tokens_len = int(slots_to_use.numel())
-                    cur_hash = self._tensor_hash(current_tokens[:tokens_len])
+                    cur_hash = self._get_cached_tokens_hash(
+                        model_input, seq_idx, current_tokens, length=tokens_len
+                    )
                 except Exception:
                     # 回退：使用完整序列（可能导致误判）
-                    cur_hash = self._tensor_hash(current_tokens)
+                    cur_hash = self._get_cached_tokens_hash(model_input, seq_idx, current_tokens)
                 if tokens_hash != cur_hash:
                     logger.warning("token哈希不一致，跳过该序列: %s", file_path)
                     continue
@@ -648,15 +824,46 @@ class KVEngine(DistributedKVEngineBase):
             # - 如果只有单个文件也可走同一路径。
             try:
                 blocks = []  # list of (offset, key_tensor, value_tensor, block_len, block_slots)
-
-                # Helper to add one file's payload if compatible
                 def _collect_from_file(rel_path, meta_obj=None):
                     try:
                         kvb = self._storage_download_kv_bytes(rel_path)
                         if kvb is None:
-                            return
+                            try:
+                                import os as _os
+                                import io as _io
+                                for root in ("/kvcache_v1/local", "/kvcache_v1/remote"):
+                                    p = f"{root}/{rel_path}"
+                                    try:
+                                        if _os.path.exists(p):
+                                            with open(p, "rb") as f:
+                                                kvb = _io.BytesIO(f.read()).getvalue()
+                                            break
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                kvb = None
+                            if kvb is None:
+                                self._dbg(f"[retrieve] skip {rel_path}: download None")
+                                return
                         info = self._storage.extract_payload_info(kvb)
                         pm = info.get("payload_meta", {}) if isinstance(info, dict) else {}
+                        try:
+                            nonlocal tokens_hash, expected_layers, payload_meta, payload_info
+                            if rel_path == stable_key:
+                                try:
+                                    t_h = pm.get("tokens_hash", None)
+                                    tokens_hash = str(t_h) if t_h is not None else None
+                                except Exception:
+                                    tokens_hash = tokens_hash
+                                try:
+                                    n_l = pm.get("num_layers", None)
+                                    expected_layers = int(n_l) if n_l is not None else None
+                                except Exception:
+                                    expected_layers = expected_layers
+                                payload_meta = pm if isinstance(pm, dict) else {}
+                                payload_info = info if isinstance(info, dict) else {}
+                        except Exception:
+                            pass
                         # prefer connector-provided token_offset (absolute) and normalize
                         # to the current sequence-relative offset
                         if isinstance(pm, dict) and "token_offset" in pm:
@@ -679,8 +886,20 @@ class KVEngine(DistributedKVEngineBase):
                                         offset = int(toks[0]) - int(start_pos)
                                 except Exception:
                                     offset = None
+                        # fallback: treat base full file as offset 0
+                        if offset is None:
+                            try:
+                                if rel_path == stable_key:
+                                    offset = 0
+                                elif isinstance(rel_path, str) and stable_key and rel_path.endswith(".pt"):
+                                    # any file that starts with the base stable_key prefix and is not a block is considered base at offset 0
+                                    if rel_path.startswith(stable_key_prefix) and ("_blk" not in rel_path):
+                                        offset = 0
+                            except Exception:
+                                pass
                         if offset is None:
                             # cannot determine offset -> skip
+                            self._dbg(f"[retrieve] skip {rel_path}: no offset")
                             return
                         # bounds check & clamp
                         try:
@@ -706,7 +925,13 @@ class KVEngine(DistributedKVEngineBase):
                                 block_len = 0
                         except Exception:
                             block_len = 0
+                        try:
+                            if int(block_len) < int(getattr(self, "_min_store_tokens", 16)):
+                                return
+                        except Exception:
+                            return
                         if block_len <= 0:
+                            self._dbg(f"[retrieve] skip {rel_path}: block_len<=0")
                             return
                         # cap block_len to remaining seq_len, trimming for negative offsets
                         try:
@@ -722,25 +947,12 @@ class KVEngine(DistributedKVEngineBase):
                                     k_tensor = k_tensor[:, front_trim: front_trim + block_len]
                                     v_tensor = v_tensor[:, front_trim: front_trim + block_len]
                                 except Exception:
+                                    self._dbg(f"[retrieve] skip {rel_path}: trim fail")
                                     return
                         except Exception:
                             return
-                        # Strict per-block token hash verification (avoid mixing other prompts)
-                        try:
-                            pm_hash = None
-                            if isinstance(pm, dict):
-                                pm_hash = pm.get("tokens_hash", None)
-                            if pm_hash is not None:
-                                # compute hash of the current request tokens for this block window
-                                # slice uses the effective start and length
-                                cur_slice = current_tokens[eff_start: eff_start + block_len]
-                                cur_hash = self._tensor_hash(cur_slice)
-                                if pm_hash != cur_hash:
-                                    # skip blocks not matching current tokens
-                                    return
-                        except Exception:
-                            # if verification fails, conservatively skip this block
-                            return
+                        # 放宽 token hash 校验，避免因统一前缀键导致误判
+                        # （当前连接器统一使用 kv_session_0000_layer_0 前缀）
                         # Prefer per-file persisted slot mapping if present
                         block_slots = None
                         try:
@@ -761,60 +973,73 @@ class KVEngine(DistributedKVEngineBase):
                             block_slots = None
                         # store with sequence-relative offset (effective start after clamp)
                         blocks.append((eff_start, k_tensor, v_tensor, block_len, block_slots))
+                        self._dbg(f"[retrieve] collected block rel={rel_path} offset={eff_start} len={block_len} slots_len={None if block_slots is None else block_slots.numel()}")
                     except Exception:
                         return
+                _collect_from_file(stable_key, meta_obj=None)
 
-                # 1) 如果存在完全匹配的元数据（即基于完整 token hash），优先收集
-                if meta is not None and getattr(meta, "status", None) == 1:
-                    _collect_from_file(meta.file_path, meta_obj=meta)
-
-                # 2) 扫描所有元数据键，收集属于同一 session/layer 的条目
-                try:
-                    full_keys = self._meta.scan_all_metadata_keys()
-                except Exception:
-                    full_keys = []
-
+                # 1) 从索引中过滤属于同一 session/layer 的块条目
                 # 当上游没有显式提供 session_id / layer_id 时，聚合应当与键生成规则保持一致：
                 # - session_id 缺省等同于 b"session_0000"
                 # - layer_id 缺省等同于 0
                 session_id_effective = session_id if session_id is not None else b"session_0000"
                 layer_id_effective = layer_id if layer_id is not None else 0
-
-                etcd_prefix = getattr(self._meta, "prefix", "/kvmeta")
-                for full_key in full_keys:
+                entries = meta_index.get((session_id_effective, layer_id_effective), [])
+                for rel, m in entries:
                     try:
-                        # full_key 带前缀，转换为相对 file_path
-                        rel = full_key
-                        if rel.startswith(etcd_prefix + "/"):
-                            rel = rel[len(etcd_prefix) + 1 :]
-                        rel = rel.lstrip("/")
-                        m = self._meta.get_metadata_by_full_key(full_key)
-                        if m is None:
-                            continue
-                        if getattr(m, "status", None) != 1:
-                            continue
-                        # 使用规范化后的会话与层编号进行过滤
-                        if getattr(m, "session_id", None) != session_id_effective:
-                            continue
-                        if getattr(m, "layer_id", None) != layer_id_effective:
-                            continue
-                        # avoid duplicate of already-collected exact meta
-                        # NOTE: m.file_path is capped at 128 bytes in embedded metadata;
-                        # use the etcd key-derived "rel" for actual file lookup to avoid truncation issues.
-                        if meta is not None and getattr(m, "file_path", None) == getattr(meta, "file_path", None):
+                        if stable_key_prefix:
+                            rel_s = str(rel)
+                            if not (rel_s == stable_key or (rel_s.startswith(stable_key_prefix) and ("_blk" in rel_s))):
+                                continue
+                        else:
                             continue
                         _collect_from_file(rel, meta_obj=m)
                     except Exception:
                         continue
 
+                if not blocks or len(blocks) < 2:
+                    try:
+                        import os as _os
+                        for root in ("/kvcache_v1/local", "/kvcache_v1/remote"):
+                            try:
+                                for name in _os.listdir(root):
+                                    try:
+                                        if not isinstance(name, str):
+                                            continue
+                                        if stable_key_prefix and name.startswith(stable_key_prefix):
+                                            rel = name
+                                            _collect_from_file(rel, meta_obj=None)
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
                 if not blocks:
                     # 无可用块
                     logger.debug(f"序列 {seq_idx} 未找到可用的块进行聚合，跳过")
+                    self._dbg(f"[retrieve] seq_idx={seq_idx} blocks_empty")
                     restored_per_seq.append(0)
                     continue
 
-                # 按 offset 排序并逐块写回到 kv_caches
                 blocks.sort(key=lambda x: int(x[0]))
+                self._dbg(f"[retrieve] seq_idx={seq_idx} blocks_sorted_count={len(blocks)} first_offset={blocks[0][0] if blocks else None}")
+                try:
+                    import torch as _torch
+                    expected = _torch.arange(int(current_slots.numel()), device=current_slots.device, dtype=_torch.long)
+                    seq_ok = bool((current_slots[:expected.numel()] == expected).all().item())
+                except Exception:
+                    seq_ok = True
+                if not seq_ok:
+                    try:
+                        import torch as _torch
+                        current_slots = _torch.arange(int(current_slots.numel()), device=current_slots.device, dtype=_torch.long)
+                        seq_ok = True
+                    except Exception:
+                        restored_per_seq.append(0)
+                        continue
+                blocks = sorted(blocks, key=lambda x: int(x[0]))
                 restored_tokens_for_seq = 0
                 for offset, k_tensor, v_tensor, block_len, block_slots in blocks:
                     # move to device
@@ -829,33 +1054,65 @@ class KVEngine(DistributedKVEngineBase):
                         kv_cache = kv_caches[layer_idx]
                         key_cache, value_cache = self.split_kv_cache(kv_cache)
 
-                        if key_cache.dim() < 3:
+                        dims = int(key_cache.dim())
+                        if dims < 2:
                             logger.error("无法识别的KV缓存形状(写回): %s", key_cache.shape)
                             raise ValueError("Unsupported KV cache layout")
-                        # 统一视图：展平 token 维度为 [-1, num_heads, head_dim]
-                        num_heads = int(key_cache.shape[-2])
-                        head_dim = int(key_cache.shape[-1])
-                        key_view = key_cache.reshape(-1, num_heads, head_dim)
-                        value_view = value_cache.reshape(-1, num_heads, head_dim)
-                        # 选择槽位：优先使用每文件持久化的 block_slots
+                        if dims >= 3:
+                            num_heads = int(key_cache.shape[-2])
+                            head_dim = int(key_cache.shape[-1])
                         try:
                             import torch as _torch
-                            slice_slots = (block_slots
-                                           if block_slots is not None
-                                           else current_slots[offset: offset + block_len])
-                            slice_slots = slice_slots.to(dtype=_torch.long, device=input_tokens.device)
+                            if block_slots is not None:
+                                slice_slots = block_slots.to(dtype=_torch.long, device=input_tokens.device)
+                            else:
+                                slice_slots = current_slots[offset: offset + block_len].to(dtype=_torch.long, device=input_tokens.device)
                         except Exception:
                             slice_slots = current_slots
-                        # 写回（按最小可写长度）
                         if layer_k.shape[0] < slice_slots.numel():
                             logger.warning("块的 KV 长度小于目标槽位数，尝试按最小长度写回")
                         limit = min(int(layer_k.shape[0]), int(slice_slots.numel()))
                         if limit <= 0:
                             continue
-                        key_view[slice_slots[:limit]] = layer_k[:limit].to(key_view.dtype)
-                        value_view[slice_slots[:limit]] = layer_v[:limit].to(value_view.dtype)
+                        import torch as _torch
+                        if dims == 4:
+                            max_win = int(key_cache[seq_idx].shape[0])
+                            eff = min(limit, max_win)
+                            if eff <= 0:
+                                continue
+                            dest = _torch.arange(eff, dtype=_torch.long, device=input_tokens.device)
+                            key_cache[seq_idx][dest] = layer_k[:eff].to(key_cache.dtype)
+                            value_cache[seq_idx][dest] = layer_v[:eff].to(value_cache.dtype)
+                            restored_tokens_for_seq += int(eff)
+                        elif dims == 3:
+                            if int(layer_k.shape[-2]) != num_heads or int(layer_k.shape[-1]) != head_dim:
+                                continue
+                            max_win = int(key_cache.shape[0]) - int(start_pos)
+                            eff = min(limit, max_win)
+                            if eff <= 0:
+                                continue
+                            dest = _torch.arange(eff, dtype=_torch.long, device=input_tokens.device) + int(start_pos)
+                            key_cache[dest] = layer_k[:eff].to(key_cache.dtype)
+                            value_cache[dest] = layer_v[:eff].to(value_cache.dtype)
+                            restored_tokens_for_seq += int(eff)
+                        elif dims == 2:
+                            hidden = int(key_cache.shape[1])
+                            if int(getattr(layer_k, "dim", lambda: 0)()) != 2:
+                                continue
+                            if int(getattr(layer_v, "dim", lambda: 0)()) != 2:
+                                continue
+                            if int(layer_k.shape[1]) != hidden or int(layer_v.shape[1]) != hidden:
+                                continue
+                            max_win = int(key_cache.shape[0]) - int(start_pos)
+                            eff = min(limit, max_win)
+                            if eff <= 0:
+                                continue
+                            dest = _torch.arange(eff, dtype=_torch.long, device=input_tokens.device) + int(start_pos)
+                            key_cache[dest] = layer_k[:eff].to(key_cache.dtype)
+                            value_cache[dest] = layer_v[:eff].to(value_cache.dtype)
+                            restored_tokens_for_seq += int(eff)
 
-                    restored_tokens_for_seq += int(block_len)
+                    # restored_tokens_for_seq updated per layer writes above
 
                 # 统计
                 restored_len = min(restored_tokens_for_seq, seq_len)
@@ -907,46 +1164,12 @@ class KVEngine(DistributedKVEngineBase):
                     False,
                 )
             self._last_retrieve_stats = stats
+            self._perf_record("retrieve_kv", time.time() - retrieve_start_ts, tokens=total_tokens)
             return None, False, model_input
 
-        # 全量命中：构造全 0 hidden 占位以允许上层绕过模型前向
-        try:
-            total_tokens = sum(seq_lens)
-            hidden_dim = None
-            # 优先从 model_executable 中推断 embedding 维度
-            if model_executable is not None:
-                emb_mod = getattr(getattr(model_executable, "model", None), "embed_tokens", None)
-                if emb_mod is not None:
-                    hidden_dim = getattr(emb_mod, "embedding_dim", None)
-                    if hidden_dim is None and hasattr(emb_mod, "weight"):
-                        # 退化：从权重形状猜测 (vocab, hidden_dim)
-                        wt = getattr(emb_mod, "weight")
-                        if hasattr(wt, "shape") and len(wt.shape) >= 2:
-                            hidden_dim = wt.shape[-1]
-            # 如果仍无法获取，使用 KV 的尾部维度近似（num_heads * head_dim）
-            if hidden_dim is None:
-                # 期望 kv_caches[layer] 形状: [2, total_slots, num_heads, head_dim] 或更多尾部维
-                sample = kv_caches[0]
-                if sample.dim() >= 4:
-                    hidden_dim = sample.shape[-1] * sample.shape[-2]
-                else:
-                    hidden_dim = 1  # 最小占位
-            device = input_tokens.device
-            dtype = kv_caches[0].dtype if len(kv_caches) > 0 else torch.float16
-            hidden_placeholder = torch.zeros(
-                (total_tokens, hidden_dim), device=device, dtype=dtype
-            )
-        except Exception as e:
-            logger.warning(f"构造隐藏占位失败，fallback 为 None: {e}")
-            hidden_placeholder = None
-            return hidden_placeholder, False, model_input
-
-        logger.debug(
-            "KV 全量命中，返回零张量 hidden 占位并设置 bypass=True, shape=%s",
-            None if hidden_placeholder is None else tuple(hidden_placeholder.shape),
-        )
-        # 更新统计并打印摘要
-        stats["bypass"] = True
+        # 全量命中：不绕过模型前向，仅将聚合的 KV 写回，再继续正常解码
+        logger.debug("KV 全量命中，继续模型前向（不 bypass）")
+        stats["bypass"] = False
         self._last_retrieve_stats = stats
         logger.info(
             "[retrieve] summary: restored_tokens=%d/%d (100.0%%), sequences_full_hit=%d/%d, bypass=%s",
@@ -954,9 +1177,10 @@ class KVEngine(DistributedKVEngineBase):
             total_tokens,
             recovered_sequences,
             len(seq_lens),
-            True,
+            False,
         )
-        return hidden_placeholder, True, model_input
+        self._perf_record("retrieve_kv", time.time() - retrieve_start_ts, tokens=total_tokens)
+        return None, False, model_input
 
     # ------------------ Debug helpers ------------------ #
     def _maybe_setup_debug_file_handler(self):
@@ -1031,6 +1255,28 @@ class KVEngine(DistributedKVEngineBase):
         except Exception:
             pass
 
+    def _dump_slots_context(
+        self,
+        tag: str,
+        seq_idx: int,
+        seq_len: int,
+        start_pos: int,
+        file_path: str,
+        slot_mapping: torch.Tensor,
+        current_slots: torch.Tensor,
+    ):
+        if not self._debug_dump:
+            return
+        try:
+            msgs = [
+                f"[{tag}] seq_idx={seq_idx} start={start_pos} seq_len={seq_len} file={file_path}",
+                f"slot_mapping_shape={getattr(slot_mapping, 'shape', None)} dim={getattr(slot_mapping, 'dim', lambda: 'n/a')() if hasattr(slot_mapping,'dim') else 'n/a'}",
+                self._tensor_brief("current_slots", current_slots),
+            ]
+            self._dbg(" | ".join(msgs))
+        except Exception:
+            pass
+
     # ------------------ Helper: KV 结构 ------------------ #
     @staticmethod
     def split_kv_cache(kv_cache: torch.Tensor):
@@ -1056,7 +1302,21 @@ class KVEngine(DistributedKVEngineBase):
         input_tokens: torch.Tensor,
         session_id: Optional[bytes] = None,
         layer_id: Optional[int] = None,
+        stable_key: Optional[str] = None,
     ) -> str:
+        """生成文件键。
+
+        优先使用显式传入的 stable_key（用于分块存储时确保同一序列使用同一键），
+        否则回退为基于 tokens 的哈希。
+        """
+        # 优先使用外部提供的稳定键
+        if stable_key:
+            try:
+                logger.info(f"[naming] use_stable_key={stable_key}")
+            except Exception:
+                pass
+            return stable_key
+
         seq_hash = self._tensor_hash(input_tokens)
         # 如果没有提供session_id和layer_id，使用默认值
         if session_id is None:
@@ -1064,9 +1324,14 @@ class KVEngine(DistributedKVEngineBase):
         if layer_id is None:
             layer_id = 0
         # 将session_id转换为字符串
-        session_str = session_id.decode('utf-8') if isinstance(session_id, bytes) else str(session_id)
+        session_str = session_id.hex() if isinstance(session_id, (bytes, bytearray)) else str(session_id)
         # 构造文件名，不包含路径前缀
-        return f"kv_{session_str}_layer_{layer_id}_{seq_hash}.pt"
+        key = f"kv_{session_str}_layer_{layer_id}_{seq_hash}.pt"
+        try:
+            logger.info(f"[naming] gen_key session={session_str} layer={layer_id} hash={seq_hash} key={key}")
+        except Exception:
+            pass
+        return key
 
     # ------------------ Helper: 解析序列槽位映射 ------------------ #
     def _resolve_sequence_slots(
@@ -1090,6 +1355,10 @@ class KVEngine(DistributedKVEngineBase):
             # - 1D: [total_tokens] → 使用 [start_pos:end_pos] 切片
             if slot_mapping.dim() == 1:
                 current_slots = slot_mapping[start_pos:start_pos + seq_len]
+                try:
+                    current_slots = current_slots - int(start_pos)
+                except Exception:
+                    pass
             else:
                 current_slots = slot_mapping[seq_idx]
         except Exception:
@@ -1110,7 +1379,81 @@ class KVEngine(DistributedKVEngineBase):
             )
             limit = min(current_slots.numel(), seq_len)
             current_slots = current_slots[:limit]
-        return current_slots.to(dtype=torch.long)
+        try:
+            import torch as _torch
+            current_slots = current_slots.to(dtype=_torch.long)
+            if current_slots.numel() > 0:
+                current_slots = _torch.clamp(current_slots, min=0, max=max(0, int(seq_len) - 1))
+        except Exception:
+            current_slots = current_slots.to(dtype=torch.long)
+        return current_slots
+
+    # ------------------ Helper: 性能统计 ------------------ #
+    def _perf_record(self, name: str, elapsed_s: float, tokens: int = 0):
+        if not getattr(self, "_perf_enabled", False):
+            return
+        try:
+            stats = self._perf_stats.setdefault(
+                name, {"count": 0, "total_time_s": 0.0, "total_tokens": 0}
+            )
+            stats["count"] += 1
+            stats["total_time_s"] += float(elapsed_s)
+            stats["total_tokens"] += int(tokens)
+            if time.time() - self._perf_last_log >= self._perf_log_interval_s:
+                self._log_perf_stats()
+        except Exception:
+            pass
+
+    def _log_perf_stats(self):
+        try:
+            parts = []
+            for name, stats in self._perf_stats.items():
+                if stats["count"] <= 0:
+                    continue
+                avg_ms = (stats["total_time_s"] / stats["count"]) * 1000.0
+                tps = (
+                    stats["total_tokens"] / stats["total_time_s"]
+                    if stats["total_time_s"] > 0
+                    else 0.0
+                )
+                parts.append(
+                    f"{name}: count={stats['count']} avg_ms={avg_ms:.2f} tps={tps:.1f}"
+                )
+            if parts:
+                logger.info("[perf] %s", " | ".join(parts))
+            self._perf_last_log = time.time()
+        except Exception:
+            pass
+
+    # ------------------ Helper: Token 哈希缓存 ------------------ #
+    def _get_cached_tokens_hash(
+        self,
+        model_input,
+        seq_idx: int,
+        tokens: torch.Tensor,
+        length: Optional[int] = None,
+    ) -> str:
+        try:
+            cache = getattr(model_input, "_kv_tokens_hash_cache", None)
+            if cache is None:
+                cache = {}
+                setattr(model_input, "_kv_tokens_hash_cache", cache)
+            total = int(tokens.numel())
+            use_len = int(length) if length is not None else total
+            if use_len < 0:
+                use_len = 0
+            if use_len > total:
+                use_len = total
+            key = (int(seq_idx), int(use_len))
+            if key in cache:
+                return cache[key]
+            h = self._tensor_hash(tokens[:use_len] if use_len > 0 else tokens)
+            cache[key] = h
+            return h
+        except Exception:
+            if length is not None and length > 0:
+                return self._tensor_hash(tokens[:length])
+            return self._tensor_hash(tokens)
     
     def _storage_insert(
         self,
@@ -1251,6 +1594,22 @@ def init_engine(config=None, config_path: Optional[str] = None):
     """
     global _engine_singleton
     if _engine_singleton is None:
+        if config_path is None and config is not None:
+            try:
+                kvt = getattr(config, "kv_transfer_config", None)
+                cfg_path = getattr(kvt, "config_path", None) if kvt is not None else None
+                if not cfg_path and kvt is not None:
+                    extra = getattr(kvt, "kv_connector_extra_config", None)
+                    if isinstance(extra, dict):
+                        cfg_path = extra.get("config_path")
+                if not cfg_path and kvt is not None:
+                    extra = getattr(kvt, "extra_config", None)
+                    if isinstance(extra, dict):
+                        cfg_path = extra.get("config_path")
+                if cfg_path:
+                    config_path = cfg_path
+            except Exception:
+                pass
         # 如果没有提供config，则从配置文件加载
         if config is None:
             config = load_config_from_json(config_path) if config_path is not None else load_config_from_json()

@@ -65,6 +65,10 @@ class _ReqMeta:
 @dataclass
 class _V1Metadata(KVConnectorMetadata):
     requests: list[_ReqMeta] = field(default_factory=list)
+    # TODO: 按层流水化时可扩展字段：
+    # - reqs_to_load_layers: dict[req_id, dict[layer_name, TransferSpecLike]]
+    # - reqs_to_store_layers: dict[req_id, dict[layer_name, TransferSpecLike]]
+    # 填充位置：Scheduler.build_connector_meta；消费位置：start_load_kv / wait_for_layer_load / save_kv_layer
 
     def add_request(
         self,
@@ -109,7 +113,8 @@ class V1KVEngineImpl(KVConnectorBase_V1):
 
             # 优先用 config.json 里的 kv_transfer_config
             try:
-                cfg_json = load_config_from_json()
+                cfg_path = self._get_config_path(vllm_config)
+                cfg_json = load_config_from_json(cfg_path) if cfg_path else load_config_from_json()
                 kvt_json = getattr(cfg_json, "kv_transfer_config", None)
             except Exception:
                 kvt_json = None
@@ -203,6 +208,10 @@ class V1KVEngineImpl(KVConnectorBase_V1):
         if metadata is None or not isinstance(metadata, _V1Metadata):
             logger.warning("[v1_engine] start_load_kv: connector metadata is None")
             return
+        # TODO: 逐层异步加载设计：
+        # - 若 metadata 带有 reqs_to_load_layers，逐层调度后台 download -> GPU copy 任务，记录 layer -> future
+        # - get_finished/connector_output 可回传完成的 layer，供调度侧释放/继续
+        # - 当前实现为同步一次性加载，未做后台并行
 
         attn_metadata = getattr(forward_context, "attn_metadata", None)
         if attn_metadata is None:
@@ -265,6 +274,8 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                 )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
+        # TODO: 若 start_load_kv 改为分层异步，应在此阻塞/轮询 layer_name 对应的任务完成
+        # 例如：future = self._layer_load_futures.get(layer_name); future.result(timeout=...).
         return
 
     def save_kv_layer(
@@ -277,6 +288,10 @@ class V1KVEngineImpl(KVConnectorBase_V1):
         metadata: _V1Metadata = self._get_connector_metadata()  # type: ignore
         if metadata is None or not isinstance(metadata, _V1Metadata):
             return
+        # TODO: 分层异步存储思路：
+        # - 构造 layer_name 对应的 payload bytes（或 GPU -> host copy）后交给后台线程/IO 队列
+        # - 记录 layer -> future，等待 wait_for_save 或 get_finished 清理
+        # - 目前为同步写，阻塞在每层 save_kv_layer 内
 
         for req in metadata.requests:
             if not req.is_store:
@@ -353,11 +368,13 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                     pass
 
     def wait_for_save(self):
+        # TODO: 若 save_kv_layer 异步化，应在此等待所有 layer store 任务完成并处理失败重试
         return
 
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        # TODO: 若维护异步 load/store 任务，可在此返回按层/按请求完成的集合供调度侧消费
         return None, None
 
     # ---------------- Scheduler-side ----------------
@@ -383,6 +400,8 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                 create_folder=False,
             )
             req_id = getattr(request, "request_id", getattr(request, "req_id", "?"))
+            if num_tokens_to_check <= 0:
+                return 0, False
 
             # 如果 v1 元数据不可用，视为无 External Cache：直接 miss，不做磁盘存在性检查
             if self._v1_meta is None:
@@ -441,24 +460,27 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                 getattr(f, "identifier", "")
                 for f in (getattr(new_req, "mm_features", []) or [])
             ]
+            num_tokens_to_check = _align_to_block_size(
+                len(token_ids) - 1, self._block_size
+            )
+            if num_tokens_to_check <= 0:
+                continue
+            aligned_tokens = token_ids[:num_tokens_to_check]
             if getattr(new_req, "req_id", None) in self._requests_need_load:
                 logger.info(
                     "[v1_engine] build_connector_meta: new_req=%s -> LOAD",
                     getattr(new_req, "req_id", None),
                 )
                 meta.add_request(
-                    token_ids=token_ids,
+                    token_ids=aligned_tokens,
                     block_ids=(getattr(new_req, "block_ids", [[0]]) or [[0]])[0],
                     block_size=self._block_size,
                     is_store=False,
                     mm_hashes=mm_hashes,
                 )
             else:
-                num_tokens_to_check = _align_to_block_size(
-                    len(token_ids) - 1, self._block_size
-                )
                 folder = self._generate_foldername_debug(
-                    torch.tensor(token_ids)[:num_tokens_to_check],
+                    torch.tensor(aligned_tokens),
                     mm_hashes,
                     create_folder=False,
                 )
@@ -475,7 +497,7 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                         False,
                     )
                     meta.add_request(
-                        token_ids=token_ids,
+                        token_ids=aligned_tokens,
                         block_ids=(getattr(new_req, "block_ids", [[0]]) or [[0]])[
                             0
                         ],
@@ -503,7 +525,7 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                             getattr(new_req, "req_id", None),
                         )
                         meta.add_request(
-                            token_ids=token_ids,
+                            token_ids=aligned_tokens,
                             block_ids=(
                                 getattr(new_req, "block_ids", [[0]]) or [[0]]
                             )[0],
@@ -561,6 +583,27 @@ class V1KVEngineImpl(KVConnectorBase_V1):
 
     # ---------------- helpers ----------------
 
+    def _get_config_path(self, vllm_config: Any) -> Optional[str]:
+        try:
+            kvt = getattr(vllm_config, "kv_transfer_config", None)
+            if kvt is not None:
+                path = getattr(kvt, "config_path", None)
+                if path:
+                    return str(path)
+                extra = getattr(kvt, "kv_connector_extra_config", None)
+                if isinstance(extra, dict):
+                    p = extra.get("config_path")
+                    if p:
+                        return str(p)
+                extra = getattr(kvt, "extra_config", None)
+                if isinstance(extra, dict):
+                    p = extra.get("config_path")
+                    if p:
+                        return str(p)
+        except Exception:
+            pass
+        return None
+
     def _resolve_dkv_path(self, vllm_config: Any) -> Optional[str]:
         """从 kv_transfer_config / config.json 解析 dkv_storage_path."""
         # 1) 先看 vllm_config.kv_transfer_config 是否显式提供 dkv_storage_path
@@ -580,7 +623,8 @@ class V1KVEngineImpl(KVConnectorBase_V1):
 
         # 2) 否则从 config.json.kv_transfer_config 读取
         try:
-            cfg = load_config_from_json()
+            cfg_path = self._get_config_path(vllm_config)
+            cfg = load_config_from_json(cfg_path) if cfg_path else load_config_from_json()
             kvt_json = getattr(cfg, "kv_transfer_config", None)
             if kvt_json is not None:
                 path = getattr(kvt_json, "dkv_storage_path", None)
@@ -629,7 +673,7 @@ class V1KVEngineImpl(KVConnectorBase_V1):
         return foldername
 
     def _run_initial_prefetch(self, top_k: int) -> None:
-        """一次性预取最近访问的部分 hash 到 DRAM Cache（按 last_access 排序）。"""
+        """一次性预取最近访问的部分 hash 到 DRAM Cache（按 last_access 排序）"""
         if self._v1_meta is None or self._v1_storage is None:
             return
         try:
@@ -672,7 +716,7 @@ class V1KVEngineImpl(KVConnectorBase_V1):
                 continue
 
     def _prefetch_hash_layers(self, hash_id: str) -> None:
-        """针对某个 hash 目录，遍历已有的 layer 文件并触发一次下载以填充 DRAM Cache。"""
+        """针对某个 hash 目录，遍历已有的 layer 文件并触发一次下载以填充 DRAM Cache"""
         if self._v1_storage is None:
             return
         base_local = getattr(self._kv_transfer_config, "local_dir", None)
@@ -737,12 +781,24 @@ def _inject_kv_into_layer(
     if isinstance(attn_metadata, _MLA):
         num_pages, page_size = int(shape[0]), int(shape[1])
         view = dst_kv_cache_layer.reshape(num_pages * page_size, -1)
-        view[slot_mapping, ...] = src_kv_cache
+        slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+        take = min(int(slots.numel()), int(src_kv_cache.shape[0]), int(view.shape[0]))
+        if take <= 0:
+            return
+        slots = slots[:take].clamp(0, view.shape[0] - 1)
+        kv = src_kv_cache[:take, ...]
+        view[slots, ...] = kv
         view.reshape(shape)
     else:
         num_pages, page_size = int(shape[1]), int(shape[2])
         view = dst_kv_cache_layer.reshape(2, num_pages * page_size, -1)
-        view[:, slot_mapping, ...] = src_kv_cache
+        slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+        take = min(int(slots.numel()), int(src_kv_cache.shape[1]), int(view.shape[1]))
+        if take <= 0:
+            return
+        slots = slots[:take].clamp(0, view.shape[1] - 1)
+        kv = src_kv_cache[:, :take, ...]
+        view[:, slots, ...] = kv
         view.reshape(shape)
 
 
@@ -759,14 +815,29 @@ def _extract_kv_from_layer(
         _MLA = object  # type: ignore
 
     if isinstance(attn_metadata, _MLA):
-        num_pages, page_size = layer.shape[0], layer.shape[1]
-        return layer.reshape(num_pages * page_size, -1)[slot_mapping, ...]
-    num_pages, page_size = layer.shape[1], layer.shape[2]
-    return layer.reshape(2, num_pages * page_size, -1)[:, slot_mapping, ...]
+        num_pages, page_size = int(layer.shape[0]), int(layer.shape[1])
+        view = layer.reshape(num_pages * page_size, -1)
+        slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+        take = min(int(slots.numel()), int(view.shape[0]))
+        if take <= 0:
+            return view[:0, ...]
+        slots = slots[:take].clamp(0, view.shape[0] - 1)
+        return view[slots, ...]
+    num_pages, page_size = int(layer.shape[1]), int(layer.shape[2])
+    view = layer.reshape(2, num_pages * page_size, -1)
+    slots = slot_mapping.reshape(-1).to(dtype=torch.long)
+    take = min(int(slots.numel()), int(view.shape[1]))
+    if take <= 0:
+        return view[:, :0, ...]
+    slots = slots[:take].clamp(0, view.shape[1] - 1)
+    return view[:, slots, ...]
 
 
 def _align_to_block_size(num_tokens: int, block_size: int) -> int:
-    return (num_tokens - 1) // block_size * block_size
+    """Floor to nearest multiple of block_size (>=0)."""
+    if num_tokens <= 0 or block_size <= 0:
+        return 0
+    return (num_tokens // block_size) * block_size
 
 
 # ---------------- Module-level helpers (singleton) ----------------

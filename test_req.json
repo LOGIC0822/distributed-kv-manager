@@ -1,0 +1,5 @@
+{
+    "model": "/tmp/ckpt/Qwen3-0.6B",
+    "prompt": "hello world hello world hello world hello world hello world hello world hello world hello world",
+    "max_tokens": 16
+}

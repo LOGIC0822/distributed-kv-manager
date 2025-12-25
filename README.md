@@ -504,29 +504,19 @@ nohup ./etcd \
 - Then start the vLLM OpenAI-compatible server with this connector (v0 API):
 
 ```bash
-python3 vllm_adapter/vllm_start_with_inject.py \
-  --model /tmp/ckpt/Qwen --port 8100 --max-model-len 10000 \
-  --gpu-memory-utilization 0.8 \
-  --kv-transfer-config '{"kv_connector":"DistributedKVConnector","kv_role":"kv_both"}'
+bash scripts/start_vllm_v0.sh
+```
 
-python3 vllm_adapter/vllm_start_with_inject.py \
-  --model /tmp/ckpt/Qwen3-0.6B --port 8100 --max-model-len 10000 \
-  --gpu-memory-utilization 0.8 \
-  --kv-transfer-config '{"kv_connector":"DistributedKVConnector","kv_role":"kv_both"}'
-
-- Or start directly with the v1 API (no inject script needed):
+- Or start directly with the v1 API:
 
 ```bash
-python3 -m vllm.entrypoints.openai.api_server \
-  --model /tmp/ckpt/Qwen3-0.6B --port 8100 --max-model-len 10000 \
-  --gpu-memory-utilization 0.8 \
-  --kv-transfer-config '{"kv_connector":"DKVOffloadingConnector","kv_connector_module_path":"distributed_kv_manager.vllm_adapter.dkv_offloading_connector_v1","kv_role":"kv_both"}'
+USE_VLLM_V1=1 VLLM_USE_V1=1 bash scripts/start_vllm_v1.sh
 ```
 
-Note: `kv_connector_module_path` ensures vLLM imports the connector from
-`distributed_kv_manager.vllm_adapter.dkv_offloading_connector_v1` even if a
-same-name connector exists in vLLM. Keep it when running outside editable dev.
-```
+Notes:
+- `scripts/start_vllm_v0.sh` uses `config_v0.json`, `scripts/start_vllm_v1.sh` uses `config_v1.json`.
+- v1 starts with prefix caching enabled by default.
+- Update the script if you need a different `--model` or port.
 
 - Simple requests to test:
 

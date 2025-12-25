@@ -35,7 +35,7 @@ try:
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 except Exception:  # pragma: no cover - compatibility shim
-    # 轻量级兜底 stub，避免不同 vLLM 版本缺失符号导致 ImportError。
+    # 轻量级兜底 stub，避免不同 vLLM 版本缺失符号导致 ImportError
     from typing import Any, Dict, List
 
     class KVConnectorBase_V1:  # type: ignore
@@ -100,6 +100,10 @@ class DKVTransferItem:
 class DKVOffloadingConnectorMetadata(KVConnectorMetadata):  # type: ignore[misc]
     reqs_to_store: dict[str, list[DKVTransferItem]]
     reqs_to_load: dict[str, list[DKVTransferItem]]
+    # TODO: 如需分层流水化，可扩展：
+    # - reqs_to_load_layers: dict[req_id, dict[layer_name, TransferSpecLike]]
+    # - reqs_to_store_layers: dict[req_id, dict[layer_name, TransferSpecLike]]
+    # 由 Scheduler.build_connector_meta 填充，Worker.start_load_kv / wait_for_layer_load / save_kv_layer 消费
 
 
 from distributed_kv_manager.engine.v1 import init_v1_engine, destroy_v1_engine
@@ -107,14 +111,18 @@ from distributed_kv_manager.engine.v1.v1_engine import V1KVEngineImpl
 
 
 class DKVOffloadingConnector(KVConnectorBase_V1):  # type: ignore[misc]
-    """超薄连接器：所有逻辑均委托给 engine.v1.V1KVEngineImpl。"""
+    """超薄连接器：所有逻辑均委托给 engine.v1.V1KVEngineImpl"""
+    # TODO: 若在核心实现中添加分层异步 load/store 的新接口或 metadata 字段，这里需补充转发/绑定
 
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole, kv_cache_config: KVCacheConfig | None = None):  # noqa: D401,E501
         super().__init__(vllm_config, role)
         self._logger = logging.getLogger(self.__class__.__name__)
         # 在 engine 层创建核心实现，并由本类1:1转发
         self._core: V1KVEngineImpl = init_v1_engine(vllm_config, role)
-        self._logger.info("DKVOffloadingConnector(thin) forwarding to engine.v1 core, role=%s", getattr(role, "name", "?"))
+        self._logger.info(
+            "DKVOffloadingConnector(thin) forwarding to engine.v1 core, role=%s",
+            getattr(role, "name", "?"),
+        )
 
     # Worker-side -------------------------------------------------------
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -157,7 +165,7 @@ class DKVOffloadingConnector(KVConnectorBase_V1):  # type: ignore[misc]
         return self._core.take_events()
 
     # --- Metadata binding bridge ---
-    # vLLM 会在适配器上绑定/清理 metadata；这里转发到核心，使 worker 侧核心可读取。
+    # vLLM 会在适配器上绑定/清理 metadata；这里转发到核心，使 worker 侧核心可读取
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         try:
             self._core.bind_connector_metadata(connector_metadata)  # type: ignore[arg-type]

@@ -1,11 +1,13 @@
 from collections import OrderedDict
+import os
 import time
 import threading
 import logging
 
 # Metadata 缓存日志
 logger = logging.getLogger("MetadataCache")
-logger.setLevel(logging.DEBUG)
+_log_level_name = os.getenv("KV_META_LOG_LEVEL") or os.getenv("KV_LOG_LEVEL") or "INFO"
+logger.setLevel(getattr(logging, str(_log_level_name).upper(), logging.INFO))
 
 
 class MetadataCache:
